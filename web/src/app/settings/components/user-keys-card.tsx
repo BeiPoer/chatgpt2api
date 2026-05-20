@@ -35,12 +35,37 @@ function formatDateTime(value?: string | null) {
   }).format(date);
 }
 
+function normalizeQuotaInput(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return 0;
+  }
+  return Math.max(0, Math.floor(Number(trimmed) || 0));
+}
+
+function formatQuotaValue(value?: number | null) {
+  if (value === null || value === undefined) {
+    return "不限";
+  }
+  return String(Math.max(0, Math.floor(Number(value) || 0)));
+}
+
+function formatQuotaUsage(item: UserKey) {
+  const quota = Math.max(0, Math.floor(Number(item.quota) || 0));
+  const used = Math.max(0, Math.floor(Number(item.used_quota) || 0));
+  if (quota <= 0) {
+    return `已使用 ${used} · 剩余额度 不限`;
+  }
+  return `已使用 ${used} · 剩余额度 ${Math.max(0, quota - used)} / ${quota}`;
+}
+
 export function UserKeysCard() {
   const didLoadRef = useRef(false);
   const [items, setItems] = useState<UserKey[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [name, setName] = useState("");
+  const [quota, setQuota] = useState("");
   const [isCreating, setIsCreating] = useState(false);
   const [pendingIds, setPendingIds] = useState<Set<string>>(() => new Set());
   const [revealedKey, setRevealedKey] = useState("");
@@ -48,6 +73,7 @@ export function UserKeysCard() {
   const [editingItem, setEditingItem] = useState<UserKey | null>(null);
   const [editName, setEditName] = useState("");
   const [editKey, setEditKey] = useState("");
+  const [editQuota, setEditQuota] = useState("");
 
   const load = async () => {
     setIsLoading(true);
@@ -72,10 +98,11 @@ export function UserKeysCard() {
   const handleCreate = async () => {
     setIsCreating(true);
     try {
-      const data = await createUserKey(name.trim());
+      const data = await createUserKey(name.trim(), normalizeQuotaInput(quota));
       setItems(data.items);
       setRevealedKey(data.key);
       setName("");
+      setQuota("");
       setIsDialogOpen(false);
       toast.success("用户密钥已创建");
     } catch (error) {
@@ -132,6 +159,7 @@ export function UserKeysCard() {
     setEditingItem(item);
     setEditName(item.name);
     setEditKey("");
+    setEditQuota(item.quota > 0 ? String(item.quota) : "");
   };
 
   const handleEdit = async () => {
@@ -141,7 +169,9 @@ export function UserKeysCard() {
     const item = editingItem;
     const trimmedName = editName.trim();
     const trimmedKey = editKey.trim();
-    if (trimmedName === item.name && !trimmedKey) {
+    const normalizedQuota = normalizeQuotaInput(editQuota);
+    const currentQuota = Math.max(0, Math.floor(Number(item.quota) || 0));
+    if (trimmedName === item.name && !trimmedKey && normalizedQuota === currentQuota) {
       setEditingItem(null);
       return;
     }
@@ -150,11 +180,13 @@ export function UserKeysCard() {
       const data = await updateUserKey(item.id, {
         ...(trimmedName !== item.name ? { name: trimmedName } : {}),
         ...(trimmedKey ? { key: trimmedKey } : {}),
+        ...(normalizedQuota !== currentQuota ? { quota: normalizedQuota } : {}),
       });
       setItems(data.items);
       setEditingItem(null);
       setEditKey("");
-      toast.success(trimmedKey ? "用户密钥已更新" : "用户名称已更新");
+      setEditQuota("");
+      toast.success("用户密钥已更新");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "更新用户密钥失败");
     } finally {
@@ -233,6 +265,7 @@ export function UserKeysCard() {
                       <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-500">
                         <span>创建时间 {formatDateTime(item.created_at)}</span>
                         <span>最近使用 {formatDateTime(item.last_used_at)}</span>
+                        <span>{formatQuotaUsage(item)}</span>
                       </div>
                     </div>
 
@@ -282,7 +315,15 @@ export function UserKeysCard() {
         </CardContent>
       </Card>
 
-      <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+      <Dialog
+        open={isDialogOpen}
+        onOpenChange={(open) => {
+          setIsDialogOpen(open);
+          if (!open) {
+            setQuota("");
+          }
+        }}
+      >
         <DialogContent className="rounded-2xl p-6">
           <DialogHeader className="gap-2">
             <DialogTitle>创建用户密钥</DialogTitle>
@@ -299,12 +340,29 @@ export function UserKeysCard() {
               className="h-11 rounded-xl border-stone-200 bg-white"
             />
           </div>
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-stone-700">总额度（可选）</label>
+            <Input
+              type="number"
+              inputMode="numeric"
+              min="0"
+              step="1"
+              value={quota}
+              onChange={(event) => setQuota(event.target.value)}
+              placeholder="留空或 0 表示不限额"
+              className="h-11 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs leading-5 text-stone-500">设置正整数后，每次成功提交调用会消耗 1 次额度。</p>
+          </div>
           <DialogFooter>
             <Button
               type="button"
               variant="secondary"
               className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
-              onClick={() => setIsDialogOpen(false)}
+              onClick={() => {
+                setIsDialogOpen(false);
+                setQuota("");
+              }}
               disabled={isCreating}
             >
               取消
@@ -359,6 +417,7 @@ export function UserKeysCard() {
           if (!open) {
             setEditingItem(null);
             setEditKey("");
+            setEditQuota("");
           }
         }}
       >
@@ -391,6 +450,22 @@ export function UserKeysCard() {
                 保存后旧密钥会立即失效，新密钥生效。系统仍只保存哈希，不会回显当前密钥。
               </p>
             </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700">总额度</label>
+              <Input
+                type="number"
+                inputMode="numeric"
+                min="0"
+                step="1"
+                value={editQuota}
+                onChange={(event) => setEditQuota(event.target.value)}
+                placeholder="留空或 0 表示不限额"
+                className="h-11 rounded-xl border-stone-200 bg-white"
+              />
+              <p className="text-xs leading-5 text-stone-500">
+                当前已使用 {formatQuotaValue(editingItem?.used_quota)}，剩余额度 {formatQuotaValue(editingItem?.remaining_quota)}。调低总额度不会清零已使用量。
+              </p>
+            </div>
           </div>
           <DialogFooter>
             <Button
@@ -400,6 +475,7 @@ export function UserKeysCard() {
               onClick={() => {
                 setEditingItem(null);
                 setEditKey("");
+                setEditQuota("");
               }}
               disabled={editingItem ? pendingIds.has(editingItem.id) : false}
             >

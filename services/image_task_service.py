@@ -10,6 +10,7 @@ from typing import Any
 
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
+from services.auth_service import auth_service
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 
@@ -199,6 +200,9 @@ class ImageTaskService:
                 "created_at": now,
                 "updated_at": now,
             }
+            reserved = auth_service.consume_quota(identity) is not None
+            if reserved:
+                task["quota_reserved"] = True
             self._tasks[key] = task
             self._save_locked()
             should_start = True
@@ -249,6 +253,7 @@ class ImageTaskService:
         except Exception as exc:
             error_message = str(exc) or "image task failed"
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[])
+            self._refund_task_quota(key, identity)
             self._log_call(
                 identity,
                 mode,
@@ -259,6 +264,22 @@ class ImageTaskService:
                 status="failed",
                 error=error_message,
             )
+
+    def _refund_task_quota(self, key: str, identity: dict[str, object]) -> None:
+        should_refund = False
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None or not bool(task.get("quota_reserved")) or bool(task.get("quota_refunded")):
+                return
+            task["quota_refunded"] = True
+            task["updated_at"] = _now_iso()
+            self._save_locked()
+            should_refund = True
+        if should_refund:
+            try:
+                auth_service.refund_quota(identity)
+            except Exception:
+                pass
 
     def _log_call(
         self,
@@ -337,6 +358,10 @@ class ImageTaskService:
                 "created_at": _clean(item.get("created_at"), _now_iso()),
                 "updated_at": _clean(item.get("updated_at"), _clean(item.get("created_at"), _now_iso())),
             }
+            if item.get("quota_reserved"):
+                task["quota_reserved"] = True
+            if item.get("quota_refunded"):
+                task["quota_refunded"] = True
             data = item.get("data")
             if isinstance(data, list):
                 task["data"] = data
@@ -358,6 +383,12 @@ class ImageTaskService:
             if task.get("status") in UNFINISHED_STATUSES:
                 task["status"] = TASK_STATUS_ERROR
                 task["error"] = "服务已重启，未完成的图片任务已中断"
+                if bool(task.get("quota_reserved")) and not bool(task.get("quota_refunded")):
+                    try:
+                        auth_service.refund_quota({"id": task.get("owner_id"), "role": "user"})
+                        task["quota_refunded"] = True
+                    except Exception:
+                        pass
                 task["updated_at"] = _now_iso()
                 changed = True
         return changed

@@ -4,9 +4,12 @@ import json
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from services.image_task_service import ImageTaskService
+from services.storage.json_storage import JSONStorageBackend
+from services.auth_service import AuthService
 
 
 OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
@@ -143,6 +146,89 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertEqual([item["status"] for item in result["items"]], ["error", "error"])
             self.assertTrue(all("已中断" in item.get("error", "") for item in result["items"]))
+
+    def test_startup_refunds_reserved_quota_for_unfinished_user_task(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            auth_service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+            item, _ = auth_service.create_key(role="user", name="Alice", quota=1)
+            auth_service.consume_quota({"id": item["id"], "role": "user"})
+            path = Path(tmp_dir) / "image_tasks.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "running-task",
+                                "owner_id": item["id"],
+                                "status": "running",
+                                "mode": "generate",
+                                "model": "gpt-image-2",
+                                "created_at": "2099-01-01 00:00:00",
+                                "updated_at": "2099-01-01 00:00:00",
+                                "quota_reserved": True,
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch("services.image_task_service.auth_service", auth_service):
+                self.make_service(path)
+
+            updated = auth_service.list_keys(role="user")[0]
+            self.assertEqual(updated["used_quota"], 0)
+            self.assertEqual(updated["remaining_quota"], 1)
+
+    def test_submit_generation_consumes_user_key_quota(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            auth_service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+            item, raw_key = auth_service.create_key(role="user", name="Alice", quota=1)
+            identity = auth_service.authenticate(raw_key)
+            self.assertIsNotNone(identity)
+
+            with mock.patch("services.image_task_service.auth_service", auth_service):
+                service = self.make_service(Path(tmp_dir) / "image_tasks.json")
+                service.submit_generation(
+                    identity,
+                    client_task_id="quota-task",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                    base_url="http://local.test",
+                )
+                wait_for_task(service, identity, "quota-task", "success")
+
+            updated = auth_service.list_keys(role="user")[0]
+            self.assertEqual(updated["id"], item["id"])
+            self.assertEqual(updated["used_quota"], 1)
+            self.assertEqual(updated["remaining_quota"], 0)
+
+    def test_failed_generation_refunds_reserved_quota(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            auth_service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+            _, raw_key = auth_service.create_key(role="user", name="Alice", quota=1)
+            identity = auth_service.authenticate(raw_key)
+            self.assertIsNotNone(identity)
+
+            with mock.patch("services.image_task_service.auth_service", auth_service):
+                service = self.make_service(
+                    Path(tmp_dir) / "image_tasks.json",
+                    handler=lambda _payload: (_ for _ in ()).throw(RuntimeError("boom")),
+                )
+                service.submit_generation(
+                    identity,
+                    client_task_id="failed-task",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                    base_url="http://local.test",
+                )
+                wait_for_task(service, identity, "failed-task", "error")
+
+            updated = auth_service.list_keys(role="user")[0]
+            self.assertEqual(updated["used_quota"], 0)
+            self.assertEqual(updated["remaining_quota"], 1)
 
 
 if __name__ == "__main__":

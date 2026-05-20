@@ -8,7 +8,7 @@ from pathlib import Path
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
 from services.account_service import AccountService
-from services.auth_service import AuthService
+from services.auth_service import AuthQuotaExceeded, AuthService
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token
 
@@ -86,6 +86,9 @@ class AuthServiceTests(unittest.TestCase):
             self.assertEqual(item["role"], "user")
             self.assertEqual(item["name"], "Alice")
             self.assertTrue(item["enabled"])
+            self.assertEqual(item["quota"], 0)
+            self.assertEqual(item["used_quota"], 0)
+            self.assertIsNone(item["remaining_quota"])
             self.assertTrue(raw_key.startswith("sk-"))
 
             authed = service.authenticate(raw_key)
@@ -102,6 +105,58 @@ class AuthServiceTests(unittest.TestCase):
             self.assertTrue(service.delete_key(item["id"], role="user"))
             self.assertFalse(service.delete_key(item["id"], role="user"))
             self.assertEqual(service.list_keys(role="user"), [])
+
+    def test_user_key_quota_can_be_set_and_consumed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+
+            item, raw_key = service.create_key(role="user", name="Alice", quota=2)
+
+            self.assertEqual(item["quota"], 2)
+            self.assertEqual(item["used_quota"], 0)
+            self.assertEqual(item["remaining_quota"], 2)
+
+            identity = service.authenticate(raw_key)
+            self.assertIsNotNone(identity)
+            consumed = service.consume_quota(identity)
+            self.assertIsNotNone(consumed)
+            self.assertEqual(consumed["used_quota"], 1)
+            self.assertEqual(consumed["remaining_quota"], 1)
+
+            updated = service.update_key(item["id"], {"quota": 1}, role="user")
+            self.assertIsNotNone(updated)
+            self.assertEqual(updated["quota"], 1)
+            self.assertEqual(updated["used_quota"], 1)
+            self.assertEqual(updated["remaining_quota"], 0)
+
+            with self.assertRaises(AuthQuotaExceeded):
+                service.consume_quota(identity)
+
+    def test_unlimited_user_key_still_tracks_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+            _, raw_key = service.create_key(role="user", name="Alice", quota=0)
+            identity = service.authenticate(raw_key)
+
+            self.assertIsNotNone(identity)
+            consumed = service.consume_quota(identity, amount=3)
+
+            self.assertIsNotNone(consumed)
+            self.assertEqual(consumed["quota"], 0)
+            self.assertEqual(consumed["used_quota"], 3)
+            self.assertIsNone(consumed["remaining_quota"])
+
+    def test_invalid_user_key_quota_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AuthService(JSONStorageBackend(Path(tmp_dir) / "accounts.json", Path(tmp_dir) / "auth_keys.json"))
+
+            with self.assertRaisesRegex(ValueError, "额度必须"):
+                service.create_key(role="user", name="Alice", quota=-1)
+
+            item, _ = service.create_key(role="user", name="Alice")
+
+            with self.assertRaisesRegex(ValueError, "额度必须"):
+                service.update_key(item["id"], {"quota": -1}, role="user")
 
     def test_authenticate_ignores_last_used_save_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

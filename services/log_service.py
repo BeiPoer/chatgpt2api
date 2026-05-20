@@ -15,6 +15,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from services.config import DATA_DIR
+from services.auth_service import AuthQuotaExceeded, auth_service
 from services.protocol.error_response import anthropic_error_response, openai_error_response
 from utils.helper import anthropic_sse_stream, sse_json_stream
 
@@ -179,19 +180,24 @@ class LoggedCall:
     summary: str
     started: float = field(default_factory=time.time)
     request_text: str = ""
+    quota_consumed: bool = False
 
     async def run(self, handler, *args, sse: str = "openai"):
         from services.protocol.conversation import ImageGenerationError
 
         try:
+            self.reserve_quota()
             result = await run_in_threadpool(handler, *args)
         except ImageGenerationError as exc:
+            self.refund_quota()
             self.log("调用失败", status="failed", error=str(exc))
             return _image_error_response(exc)
         except HTTPException as exc:
+            self.refund_quota()
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
+            self.refund_quota()
             self.log("调用失败", status="failed", error=str(exc))
             return _protocol_error_response(exc, 502, sse)
 
@@ -203,12 +209,15 @@ class LoggedCall:
         try:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:
+            self.refund_quota()
             self.log("调用失败", status="failed", error=str(exc))
             return _image_error_response(exc)
         except HTTPException as exc:
+            self.refund_quota()
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
+            self.refund_quota()
             self.log("调用失败", status="failed", error=str(exc))
             return _protocol_error_response(exc, 502, sse)
         if not has_first:
@@ -225,11 +234,39 @@ class LoggedCall:
                 yield item
         except Exception as exc:
             failed = True
+            self.refund_quota()
             self.log("流式调用失败", status="failed", error=str(exc), urls=urls)
             raise
         finally:
             if not failed:
                 self.log("流式调用结束", urls=urls)
+
+    def reserve_quota(self) -> None:
+        if self.quota_consumed:
+            return
+        if str(self.identity.get("role") or "").strip().lower() != "user":
+            return
+        try:
+            auth_service.consume_quota(self.identity)
+            self.quota_consumed = True
+        except AuthQuotaExceeded as exc:
+            raise HTTPException(status_code=429, detail={"error": str(exc)}) from exc
+        except Exception as exc:
+            self.log("额度扣减失败", status="failed", error=str(exc))
+            raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+
+    def refund_quota(self) -> None:
+        if not self.quota_consumed:
+            return
+        try:
+            auth_service.refund_quota(self.identity)
+        except Exception:
+            pass
+        finally:
+            self.quota_consumed = False
+
+    def mark_quota_used(self) -> None:
+        self.reserve_quota()
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
             urls: list[str] | None = None) -> None:

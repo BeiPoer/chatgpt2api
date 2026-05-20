@@ -14,6 +14,10 @@ from services.storage.base import StorageBackend
 AuthRole = Literal["admin", "user"]
 
 
+class AuthQuotaExceeded(Exception):
+    pass
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -37,6 +41,25 @@ class AuthService:
     def _default_name(role: object) -> str:
         return "管理员密钥" if str(role or "").strip().lower() == "admin" else "普通用户"
 
+    @staticmethod
+    def _coerce_non_negative_int(value: object, default: int = 0) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _build_quota(cls, value: object) -> int:
+        if value is None or str(value).strip() == "":
+            return 0
+        try:
+            quota = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("额度必须是大于等于 0 的整数") from exc
+        if quota < 0:
+            raise ValueError("额度必须是大于等于 0 的整数")
+        return quota
+
     def _normalize_item(self, raw: object) -> dict[str, object] | None:
         if not isinstance(raw, dict):
             return None
@@ -50,6 +73,8 @@ class AuthService:
         name = self._clean(raw.get("name")) or self._default_name(role)
         created_at = self._clean(raw.get("created_at")) or _now_iso()
         last_used_at = self._clean(raw.get("last_used_at")) or None
+        quota = self._coerce_non_negative_int(raw.get("quota"), 0)
+        used_quota = self._coerce_non_negative_int(raw.get("used_quota"), 0)
         return {
             "id": item_id,
             "name": name,
@@ -58,6 +83,8 @@ class AuthService:
             "enabled": bool(raw.get("enabled", True)),
             "created_at": created_at,
             "last_used_at": last_used_at,
+            "quota": quota,
+            "used_quota": used_quota,
         }
 
     def _load(self) -> list[dict[str, object]]:
@@ -77,6 +104,8 @@ class AuthService:
 
     @staticmethod
     def _public_item(item: dict[str, object]) -> dict[str, object]:
+        quota = AuthService._coerce_non_negative_int(item.get("quota"), 0)
+        used_quota = AuthService._coerce_non_negative_int(item.get("used_quota"), 0)
         return {
             "id": item.get("id"),
             "name": item.get("name"),
@@ -84,6 +113,9 @@ class AuthService:
             "enabled": bool(item.get("enabled", True)),
             "created_at": item.get("created_at"),
             "last_used_at": item.get("last_used_at"),
+            "quota": quota,
+            "used_quota": used_quota,
+            "remaining_quota": max(0, quota - used_quota) if quota > 0 else None,
         }
 
     def list_keys(self, role: AuthRole | None = None) -> list[dict[str, object]]:
@@ -147,10 +179,11 @@ class AuthService:
             raise ValueError("这个名称已经在使用中了，换一个更容易区分的名称吧")
         return candidate
 
-    def create_key(self, *, role: AuthRole, name: str = "") -> tuple[dict[str, object], str]:
+    def create_key(self, *, role: AuthRole, name: str = "", quota: int | None = None) -> tuple[dict[str, object], str]:
         with self._lock:
             self._reload_locked()
             normalized_name = self._build_name_locked(name, role=role)
+            normalized_quota = self._build_quota(quota)
             while True:
                 raw_key = f"sk-{secrets.token_urlsafe(24)}"
                 try:
@@ -166,6 +199,8 @@ class AuthService:
                 "enabled": True,
                 "created_at": _now_iso(),
                 "last_used_at": None,
+                "quota": normalized_quota,
+                "used_quota": 0,
             }
             self._items.append(item)
             self._save()
@@ -200,6 +235,8 @@ class AuthService:
                     next_item["enabled"] = bool(updates.get("enabled"))
                 if "key" in updates and updates.get("key") is not None:
                     next_item["key_hash"] = self._build_key_hash_locked(str(updates.get("key") or ""), exclude_id=normalized_id)
+                if "quota" in updates and updates.get("quota") is not None:
+                    next_item["quota"] = self._build_quota(updates.get("quota"))
                 self._items[index] = next_item
                 self._save()
                 return self._public_item(next_item)
@@ -248,6 +285,72 @@ class AuthService:
                         pass
                 return self._public_item(next_item)
         return None
+
+    def ensure_quota_available(self, identity: dict[str, object], amount: int = 1) -> None:
+        if self._clean(identity.get("role")).lower() != "user":
+            return
+        try:
+            normalized_amount = max(0, int(amount or 0))
+        except (TypeError, ValueError):
+            normalized_amount = 0
+        if normalized_amount <= 0:
+            return
+        quota = self._coerce_non_negative_int(identity.get("quota"), 0)
+        used_quota = self._coerce_non_negative_int(identity.get("used_quota"), 0)
+        if quota > 0 and used_quota + normalized_amount > quota:
+            raise AuthQuotaExceeded("用户密钥额度已用完")
+
+    def consume_quota(self, identity: dict[str, object], amount: int = 1) -> dict[str, object] | None:
+        if self._clean(identity.get("role")).lower() != "user":
+            return None
+        normalized_id = self._clean(identity.get("id"))
+        try:
+            normalized_amount = max(0, int(amount or 0))
+        except (TypeError, ValueError):
+            normalized_amount = 0
+        if not normalized_id or normalized_amount <= 0:
+            return None
+        with self._lock:
+            self._reload_locked()
+            for index, item in enumerate(self._items):
+                if item.get("id") != normalized_id or item.get("role") != "user":
+                    continue
+                next_item = dict(item)
+                quota = self._coerce_non_negative_int(next_item.get("quota"), 0)
+                used_quota = self._coerce_non_negative_int(next_item.get("used_quota"), 0)
+                if quota > 0 and used_quota + normalized_amount > quota:
+                    raise AuthQuotaExceeded("用户密钥额度已用完")
+                next_item["used_quota"] = used_quota + normalized_amount
+                self._items[index] = next_item
+                self._save()
+                return self._public_item(next_item)
+        return None
+
+    def refund_quota(self, identity: dict[str, object], amount: int = 1) -> dict[str, object] | None:
+        if self._clean(identity.get("role")).lower() != "user":
+            return None
+        normalized_id = self._clean(identity.get("id"))
+        try:
+            normalized_amount = max(0, int(amount or 0))
+        except (TypeError, ValueError):
+            normalized_amount = 0
+        if not normalized_id or normalized_amount <= 0:
+            return None
+        with self._lock:
+            self._reload_locked()
+            for index, item in enumerate(self._items):
+                if item.get("id") != normalized_id or item.get("role") != "user":
+                    continue
+                next_item = dict(item)
+                used_quota = self._coerce_non_negative_int(next_item.get("used_quota"), 0)
+                next_item["used_quota"] = max(0, used_quota - normalized_amount)
+                self._items[index] = next_item
+                self._save()
+                return self._public_item(next_item)
+        return None
+
+    def mark_quota_used(self, identity: dict[str, object], amount: int = 1) -> dict[str, object] | None:
+        return self.consume_quota(identity, amount)
 
 
 auth_service = AuthService(config.get_storage_backend())

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request
+from services.auth_service import AuthQuotaExceeded
 from services.image_task_service import image_task_service
 from services.log_service import LoggedCall
 
@@ -59,6 +60,8 @@ def create_router() -> APIRouter:
                 size=body.size,
                 base_url=resolve_image_base_url(request),
             )
+        except AuthQuotaExceeded as exc:
+            raise HTTPException(status_code=429, detail={"error": str(exc)}) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
@@ -87,6 +90,8 @@ def create_router() -> APIRouter:
                 base_url=resolve_image_base_url(request),
                 images=images,
             )
+        except AuthQuotaExceeded as exc:
+            raise HTTPException(status_code=429, detail={"error": str(exc)}) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
