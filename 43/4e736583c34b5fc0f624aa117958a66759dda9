@@ -1,0 +1,19 @@
+docker-compose.yml
+  s_546b6926684701::t_b32ea40d25631b 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.7",
+  "base_commit_sha": "434e736583c34b5fc0f624aa117958a66759dda9",
+  "prompts": {},
+  "sessions": {
+    "s_546b6926684701": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ed9dc-3f35-74a2-ac99-2ce3ee0d8660",
+        "model": "gpt-5.5"
+      },
+      "human_author": "beipoer <forczc@foxmail.com>"
+    }
+  }
+}
