@@ -21,6 +21,7 @@ ImageSource = str | UploadFile | ImageInput
 
 MAX_IMAGE_REFERENCE_BYTES = 50 * 1024 * 1024
 IMAGE_REFERENCE_FIELDS = {"image", "image[]", "images", "images[]", "image_url", "image_url[]"}
+MASK_REFERENCE_FIELDS = {"mask", "mask[]"}
 
 
 def _clean(value: object, default: str = "") -> str:
@@ -69,6 +70,7 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
         "model": _clean(fields.get("model"), "gpt-image-2"),
         "n": _parse_count(fields.get("n")),
         "size": _clean(fields.get("size")) or None,
+        "quality": _clean(fields.get("quality"), "auto"),
         "response_format": _clean(fields.get("response_format"), "b64_json"),
         "stream": _parse_bool(fields.get("stream")),
     }
@@ -156,8 +158,19 @@ def _json_image_sources(body: dict[str, Any]) -> list[ImageSource]:
     return sources
 
 
-async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], list[ImageSource]]:
-    """解析图片编辑请求：同时支持 multipart 上传和官方 JSON 图片 URL。"""
+def _json_mask_sources(body: dict[str, Any]) -> list[ImageSource]:
+    """读取 JSON mask 引用。"""
+    mask = body.get("mask")
+    if mask is not None:
+        return _sources_from_value(mask)
+    return []
+
+
+async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], list[ImageSource], list[ImageSource]]:
+    """解析图片编辑请求：同时支持 multipart 上传和官方 JSON 图片 URL。
+    
+    返回 (payload, image_sources, mask_sources)
+    """
     content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if content_type == "application/json":
         try:
@@ -166,19 +179,22 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
             raise HTTPException(status_code=400, detail={"error": "invalid JSON body"}) from exc
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail={"error": "JSON body must be an object"})
-        return _payload_from_fields(body), _json_image_sources(body)
+        return _payload_from_fields(body), _json_image_sources(body), _json_mask_sources(body)
 
     form = await request.form()
     fields: dict[str, Any] = {}
-    for key in ("client_task_id", "prompt", "model", "n", "size", "response_format", "stream"):
+    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream"):
         value = form.get(key)
         if isinstance(value, str):
             fields[key] = value
     sources: list[ImageSource] = []
+    mask_sources: list[ImageSource] = []
     for key, value in form.multi_items():
         if key in IMAGE_REFERENCE_FIELDS:
             sources.extend(_sources_from_value(value))
-    return _payload_from_fields(fields), sources
+        elif key in MASK_REFERENCE_FIELDS:
+            mask_sources.extend(_sources_from_value(value))
+    return _payload_from_fields(fields), sources, mask_sources
 
 
 def _extension_from_mime(mime_type: str) -> str:
