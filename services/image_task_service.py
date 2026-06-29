@@ -417,6 +417,9 @@ class ImageTaskService:
                 task["quota_reserved"] = True
             if item.get("quota_refunded"):
                 task["quota_refunded"] = True
+            conversation_id = _clean(item.get("conversation_id"))
+            if conversation_id:
+                task["conversation_id"] = conversation_id
             data = item.get("data")
             if isinstance(data, list):
                 task["data"] = data
@@ -514,11 +517,12 @@ class ImageTaskService:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
         backend = None
+        quota_recharged = False
         try:
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
 
-            backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
+            backend = OpenAIBackendAPI()
             file_ids, sediment_ids = backend._poll_image_results(
                 conversation_id,
                 extra_timeout_secs,
@@ -550,6 +554,8 @@ class ImageTaskService:
                 "",
                 int(time.time()),
             )["data"]
+            if data:
+                quota_recharged = self._recharge_refunded_task_quota(key, identity)
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
             self._log_call(
                 identity,
@@ -564,6 +570,8 @@ class ImageTaskService:
             error_message = str(exc) or "resume poll failed"
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[], duration_ms=duration_ms)
+            if quota_recharged:
+                self._refund_task_quota(key, identity)
             self._log_call(
                 identity,
                 mode,
@@ -576,6 +584,26 @@ class ImageTaskService:
         finally:
             if backend is not None:
                 backend.close()
+
+    def _recharge_refunded_task_quota(self, key: str, identity: dict[str, object]) -> bool:
+        should_recharge = False
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None or not bool(task.get("quota_reserved")) or not bool(task.get("quota_refunded")):
+                return False
+            should_recharge = True
+        if not should_recharge:
+            return False
+        auth_service.consume_quota(identity)
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                auth_service.refund_quota(identity)
+                return False
+            task["quota_refunded"] = False
+            task["updated_at"] = _now_iso()
+            self._save_locked()
+        return True
 
 
 image_task_service = ImageTaskService(DATA_DIR / "image_tasks.json")

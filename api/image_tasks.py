@@ -99,6 +99,8 @@ def create_router() -> APIRouter:
                 images=images,
                 masks=masks,
             )
+        except AuthQuotaExceeded as exc:
+            raise HTTPException(status_code=429, detail={"error": str(exc)}) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 

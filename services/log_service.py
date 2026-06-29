@@ -158,6 +158,19 @@ def _collect_conversation_ids(value: object) -> list[str]:
     return ids
 
 
+def _count_image_data_items(value: object) -> int:
+    if not isinstance(value, dict):
+        return 0
+    data = value.get("data")
+    if not isinstance(data, list):
+        return 0
+    return sum(
+        1
+        for item in data
+        if isinstance(item, dict) and (item.get("url") or item.get("b64_json"))
+    )
+
+
 def _strip_internal_response_fields(value: object) -> object:
     if isinstance(value, dict):
         return {
@@ -224,6 +237,8 @@ class LoggedCall:
     started: float = field(default_factory=time.time)
     request_text: str = ""
     quota_consumed: bool = False
+    quota_amount: int = 1
+    quota_consumed_amount: int = 0
     request_shape: dict[str, int] | None = None
 
     async def run(self, handler, *args, sse: str = "openai"):
@@ -249,6 +264,7 @@ class LoggedCall:
             return _protocol_error_response(exc, 502, sse)
 
         if isinstance(result, dict):
+            self.settle_quota(self.success_quota_amount(result))
             self.log("调用完成", result)
             response = dict(result)
             response.pop("_account_email", None)
@@ -273,6 +289,7 @@ class LoggedCall:
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
         if not has_first:
+            self.settle_quota(0 if self.endpoint.startswith("/v1/images") else self.quota_consumed_amount)
             self.log("流式调用结束")
             return StreamingResponse(sender(()), media_type="text/event-stream")
         return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
@@ -281,12 +298,14 @@ class LoggedCall:
         urls: list[str] = []
         account_emails: list[str] = []
         conversation_ids: list[str] = []
+        image_count = 0
         failed = False
         try:
             for item in items:
                 urls.extend(_collect_urls(item))
                 account_emails.extend(_collect_account_emails(item))
                 conversation_ids.extend(_collect_conversation_ids(item))
+                image_count += _count_image_data_items(item) if self.endpoint.startswith("/v1/images") else 0
                 yield _strip_internal_response_fields(item)
         except Exception as exc:
             failed = True
@@ -306,17 +325,33 @@ class LoggedCall:
             raise
         finally:
             if not failed:
+                self.settle_quota(image_count if self.endpoint.startswith("/v1/images") else self.quota_consumed_amount)
                 self.log("流式调用结束", urls=urls, account_email=account_emails[0] if account_emails else "",
                          conversation_id=conversation_ids[0] if conversation_ids else "")
 
+    def normalized_quota_amount(self) -> int:
+        try:
+            return max(0, int(self.quota_amount or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def success_quota_amount(self, result: object) -> int:
+        if self.endpoint.startswith("/v1/images"):
+            return _count_image_data_items(result)
+        return self.quota_consumed_amount or self.normalized_quota_amount()
+
     def reserve_quota(self) -> None:
-        if self.quota_consumed:
+        if self.quota_consumed_amount > 0:
             return
         if str(self.identity.get("role") or "").strip().lower() != "user":
             return
+        amount = self.normalized_quota_amount()
+        if amount <= 0:
+            return
         try:
-            auth_service.consume_quota(self.identity)
+            auth_service.consume_quota(self.identity, amount)
             self.quota_consumed = True
+            self.quota_consumed_amount = amount
         except AuthQuotaExceeded as exc:
             raise HTTPException(status_code=429, detail={"error": str(exc)}) from exc
         except Exception as exc:
@@ -324,14 +359,32 @@ class LoggedCall:
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
 
     def refund_quota(self) -> None:
-        if not self.quota_consumed:
+        if self.quota_consumed_amount <= 0:
             return
+        amount = self.quota_consumed_amount
         try:
-            auth_service.refund_quota(self.identity)
+            auth_service.refund_quota(self.identity, amount)
         except Exception:
             pass
         finally:
             self.quota_consumed = False
+            self.quota_consumed_amount = 0
+
+    def settle_quota(self, used_amount: int) -> None:
+        if self.quota_consumed_amount <= 0:
+            return
+        try:
+            normalized_used = max(0, int(used_amount or 0))
+        except (TypeError, ValueError):
+            normalized_used = 0
+        refund_amount = max(0, self.quota_consumed_amount - normalized_used)
+        if refund_amount:
+            try:
+                auth_service.refund_quota(self.identity, refund_amount)
+            except Exception:
+                pass
+        self.quota_consumed_amount = max(0, self.quota_consumed_amount - refund_amount)
+        self.quota_consumed = self.quota_consumed_amount > 0
 
     def mark_quota_used(self) -> None:
         self.reserve_quota()
