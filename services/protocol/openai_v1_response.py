@@ -45,6 +45,12 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
 RESPONSE_CONTENT_PART_TYPES = {"text", "input_text", "output_text", "image_url", "input_image", "image"}
 
 
+def close_backend(backend: object) -> None:
+    close = getattr(backend, "close", None)
+    if callable(close):
+        close()
+
+
 def is_text_response_request(body: dict[str, Any]) -> bool:
     return not has_response_image_generation_tool(body)
 
@@ -284,18 +290,21 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
     yield response_created(response_id, model, created)
     yield {"type": "response.output_item.added", "output_index": 0, "item": text_output_item("", item_id, "in_progress")}
     request = ConversationRequest(model=model, messages=messages)
-    for delta in stream_text_deltas(backend, request):
-        full_text += delta
-        yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": delta}
-    yield {"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": full_text}
-    item = text_output_item(full_text, item_id, "completed")
-    yield {"type": "response.output_item.done", "output_index": 0, "item": item}
-    usage = token_usage(
-        input_text_tokens=count_message_text_tokens(messages, model),
-        input_image_tokens=count_message_image_tokens(messages, model),
-        output_text_tokens=count_text_tokens(full_text, model),
-    )
-    yield response_completed(response_id, model, created, [item], usage)
+    try:
+        for delta in stream_text_deltas(backend, request):
+            full_text += delta
+            yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": delta}
+        yield {"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": full_text}
+        item = text_output_item(full_text, item_id, "completed")
+        yield {"type": "response.output_item.done", "output_index": 0, "item": item}
+        usage = token_usage(
+            input_text_tokens=count_message_text_tokens(messages, model),
+            input_image_tokens=count_message_image_tokens(messages, model),
+            output_text_tokens=count_text_tokens(full_text, model),
+        )
+        yield response_completed(response_id, model, created, [item], usage)
+    finally:
+        close_backend(backend)
 
 
 def stream_web_search_response(body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:

@@ -289,18 +289,27 @@ def _stream_buffered_blocks(content: list[dict[str, object]], start_index: int =
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     request = message_request(body)
     if body.get("stream"):
-        return stream_events(
-            stream_text_chat_completion(request.backend, request.messages, request.model),
+        def stream():
+            try:
+                yield from stream_events(
+                    stream_text_chat_completion(request.backend, request.messages, request.model),
+                    request.model,
+                    count_message_tokens(request.messages, request.model),
+                    lambda text: count_text_tokens(text, request.model),
+                    request.tools,
+                )
+            finally:
+                request.backend.close()
+
+        return stream()
+    try:
+        text = collect_chat_content(stream_text_chat_completion(request.backend, request.messages, request.model))
+        return message_response(
             request.model,
+            text,
             count_message_tokens(request.messages, request.model),
-            lambda text: count_text_tokens(text, request.model),
+            count_text_tokens(text, request.model),
             request.tools,
         )
-    text = collect_chat_content(stream_text_chat_completion(request.backend, request.messages, request.model))
-    return message_response(
-        request.model,
-        text,
-        count_message_tokens(request.messages, request.model),
-        count_text_tokens(text, request.model),
-        request.tools,
-    )
+    finally:
+        request.backend.close()

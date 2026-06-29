@@ -201,6 +201,23 @@ class OpenAIBackendAPI:
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
 
+    def close(self) -> None:
+        """关闭底层 HTTP session，释放连接和文件句柄。"""
+        session = getattr(self, "session", None)
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+            finally:
+                self.session = None
+
+    def __enter__(self) -> "OpenAIBackendAPI":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
     def _build_fp(self) -> Dict[str, str]:
         account = self.account
         raw_fp = account.get("fp")

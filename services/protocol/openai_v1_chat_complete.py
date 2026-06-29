@@ -44,6 +44,12 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
 )
 
 
+def close_backend(backend: object) -> None:
+    close = getattr(backend, "close", None)
+    if callable(close):
+        close()
+
+
 def completion_chunk(model: str, delta: dict[str, Any], finish_reason: str | None = None, completion_id: str = "", created: int | None = None) -> dict[str, Any]:
     return {
         "id": completion_id or f"chatcmpl-{uuid.uuid4().hex}",
@@ -101,15 +107,18 @@ def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: 
     created = int(time.time())
     sent_role = False
     request = ConversationRequest(model=model, messages=messages)
-    for delta_text in stream_text_deltas(backend, request):
+    try:
+        for delta_text in stream_text_deltas(backend, request):
+            if not sent_role:
+                sent_role = True
+                yield completion_chunk(model, {"role": "assistant", "content": delta_text}, None, completion_id, created)
+            else:
+                yield completion_chunk(model, {"content": delta_text}, None, completion_id, created)
         if not sent_role:
-            sent_role = True
-            yield completion_chunk(model, {"role": "assistant", "content": delta_text}, None, completion_id, created)
-        else:
-            yield completion_chunk(model, {"content": delta_text}, None, completion_id, created)
-    if not sent_role:
-        yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
-    yield completion_chunk(model, {}, "stop", completion_id, created)
+            yield completion_chunk(model, {"role": "assistant", "content": ""}, None, completion_id, created)
+        yield completion_chunk(model, {}, "stop", completion_id, created)
+    finally:
+        close_backend(backend)
 
 
 def collect_chat_content(chunks: Iterable[dict[str, Any]]) -> str:
@@ -122,6 +131,18 @@ def collect_chat_content(chunks: Iterable[dict[str, Any]]) -> str:
         if content:
             parts.append(content)
     return "".join(parts)
+
+
+def collect_text_response(model: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    backend = text_backend()
+    try:
+        return completion_response(
+            model,
+            collect_text(backend, ConversationRequest(model=model, messages=messages)),
+            messages=messages,
+        )
+    finally:
+        close_backend(backend)
 
 
 def chat_messages_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -279,9 +300,5 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     key = cache_key(body, messages, stream=False)
     return chat_completion_cache.get_or_compute_response(
         key,
-        lambda: completion_response(
-            model,
-            collect_text(text_backend(), ConversationRequest(model=model, messages=messages)),
-            messages=messages,
-        ),
+        lambda: collect_text_response(model, messages),
     )
