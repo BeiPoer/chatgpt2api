@@ -204,7 +204,7 @@ function normalizeConversation(conversation: ImageConversation & Record<string, 
 }
 
 function sortImageConversations(conversations: ImageConversation[]): ImageConversation[] {
-  return [...conversations].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return [...conversations].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
 function getTimestamp(value: string) {

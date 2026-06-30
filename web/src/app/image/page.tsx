@@ -275,7 +275,7 @@ function pickFallbackConversationId(conversations: ImageConversation[]) {
 }
 
 function sortImageConversations(conversations: ImageConversation[]) {
-  return [...conversations].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return [...conversations].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
 function deriveTurnStatus(turn: ImageTurn): Pick<ImageTurn, "status" | "error"> {
