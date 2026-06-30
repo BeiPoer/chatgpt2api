@@ -14,6 +14,8 @@ from services.register import mail_provider, openai_register
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
+SCHEDULER_WAIT_SECONDS = 5.0
+MIN_WORKER_TIMEOUT_SECONDS = 30 * 60
 
 
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
@@ -269,36 +271,99 @@ class RegisterService:
             self._config["stats"]["updated_at"] = _now()
             self._save()
 
+    @staticmethod
+    def _positive_float(value: object, default: float) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return default
+        return result if result > 0 else default
+
+    @classmethod
+    def _worker_timeout_seconds(cls, cfg: dict) -> float:
+        """单个注册 worker 的保守超时上限。
+
+        大多数网络请求已有单次 timeout；这里兜底防止某个 socket/IMAP 调用卡死后永久占住注册槽位。
+        """
+        manual = cfg.get("worker_timeout")
+        if manual:
+            return max(60.0, cls._positive_float(manual, MIN_WORKER_TIMEOUT_SECONDS))
+        mail = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
+        request_timeout = cls._positive_float(mail.get("request_timeout"), 30.0)
+        wait_timeout = cls._positive_float(mail.get("wait_timeout"), 30.0)
+        expected = request_timeout * 20 + wait_timeout * 2 + 180
+        return max(float(MIN_WORKER_TIMEOUT_SECONDS), expected)
+
+    @staticmethod
+    def _format_seconds(seconds: float) -> str:
+        value = max(0, int(seconds))
+        minutes, sec = divmod(value, 60)
+        if minutes:
+            return f"{minutes}分{sec}秒"
+        return f"{sec}秒"
+
     def _run(self) -> None:
         threads = int(self.get()["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
-        with ThreadPoolExecutor(max_workers=threads) as executor:
-            futures = set()
+        executor = ThreadPoolExecutor(max_workers=threads)
+        futures = set()
+        started_at_by_future: dict[object, float] = {}
+        try:
             while True:
                 cfg = self.get()
                 while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
                     submitted += 1
-                    futures.add(executor.submit(openai_register.worker, submitted))
-                self._bump(running=len(futures), done=done, success=success, fail=fail)
+                    future = executor.submit(openai_register.worker, submitted)
+                    futures.add(future)
+                    started_at_by_future[future] = time.monotonic()
+                self._bump(running=len(futures), done=done, success=success, fail=fail, **self._pool_metrics())
                 if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
                     break
                 if not futures:
                     time.sleep(max(1, int(cfg.get("check_interval") or 5)))
                     continue
-                finished, futures = wait(futures, return_when=FIRST_COMPLETED)
+                wait_seconds = min(SCHEDULER_WAIT_SECONDS, max(1, int(cfg.get("check_interval") or 5)))
+                finished, pending = wait(futures, timeout=wait_seconds, return_when=FIRST_COMPLETED)
+                futures = set(pending)
+                worker_timeout = self._worker_timeout_seconds(cfg)
+                stale_futures = [
+                    future for future in futures
+                    if time.monotonic() - started_at_by_future.get(future, time.monotonic()) >= worker_timeout
+                ]
+                if stale_futures:
+                    for future in stale_futures:
+                        futures.discard(future)
+                        started_at_by_future.pop(future, None)
+                        future.cancel()
+                        done += 1
+                        fail += 1
+                    self._append_log(
+                        "发现注册任务超过"
+                        f"{self._format_seconds(worker_timeout)}仍未结束，已释放 {len(stale_futures)} 个调度槽继续补新任务；"
+                        "如果底层网络调用仍未返回，它会在后台自然超时。",
+                        "red",
+                    )
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    executor = ThreadPoolExecutor(max_workers=threads)
                 for future in finished:
+                    started_at_by_future.pop(future, None)
                     done += 1
                     try:
                         result = future.result()
                         success += 1 if result.get("ok") else 0
                         fail += 0 if result.get("ok") else 1
-                    except Exception:
+                    except Exception as exc:
                         fail += 1
-        self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
-        with self._lock:
-            self._config["enabled"] = False
-            self._save()
-        self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
+                        self._append_log(f"注册任务异常结束: {exc}", "red")
+        except Exception as exc:
+            self._append_log(f"注册调度异常退出: {exc}", "red")
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
+            with self._lock:
+                self._config["enabled"] = False
+                self._save()
+            self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
 
 
 register_service = RegisterService(REGISTER_FILE)

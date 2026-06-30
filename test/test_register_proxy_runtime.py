@@ -43,6 +43,9 @@ class FakeProxySettings:
         self.build_headers_calls = []
         self.refresh_calls = []
 
+    def get_profile(self, **kwargs):
+        return type("FakeProfile", (), {"clearance_enabled": True})()
+
     def build_session_kwargs(self, **kwargs):
         self.session_kwargs_calls.append(kwargs)
         return dict(kwargs, proxy="http://runtime.example:8118")

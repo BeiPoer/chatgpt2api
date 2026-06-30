@@ -1244,7 +1244,7 @@ class OutlookTokenProvider(BaseMailProvider):
     def _imap_messages(self, mailbox: dict[str, Any], access_token: str) -> list[dict[str, Any]]:
         """返回最近 N 封邮件，最新在前。"""
         auth_string = f"user={mailbox['address']}\x01auth=Bearer {access_token}\x01\x01"
-        imap = imaplib.IMAP4_SSL(self.imap_host)
+        imap = imaplib.IMAP4_SSL(self.imap_host, timeout=self.conf["request_timeout"])
         try:
             imap.authenticate("XOAUTH2", lambda _: auth_string.encode("utf-8"))
             status, _ = imap.select("INBOX", readonly=True)
