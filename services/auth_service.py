@@ -102,6 +102,60 @@ class AuthService:
     def _reload_locked(self) -> None:
         self._items = self._load()
 
+    @classmethod
+    def _debug_items_state(cls, items: list[dict[str, object]], candidate_hash: str = "") -> dict[str, object]:
+        state: dict[str, object] = {
+            "total": len(items),
+            "enabled": 0,
+            "disabled": 0,
+            "enabled_user": 0,
+            "enabled_admin": 0,
+            "candidate_match": "not_checked" if not candidate_hash else "none",
+        }
+        for item in items:
+            enabled = bool(item.get("enabled", True))
+            role = cls._clean(item.get("role")).lower()
+            if enabled:
+                state["enabled"] = int(state["enabled"]) + 1
+                if role == "user":
+                    state["enabled_user"] = int(state["enabled_user"]) + 1
+                elif role == "admin":
+                    state["enabled_admin"] = int(state["enabled_admin"]) + 1
+            else:
+                state["disabled"] = int(state["disabled"]) + 1
+
+            stored_hash = cls._clean(item.get("key_hash"))
+            if candidate_hash and stored_hash and hmac.compare_digest(stored_hash, candidate_hash):
+                state["candidate_match"] = "enabled" if enabled else "disabled"
+                state["candidate_match_role"] = role or None
+                state["candidate_match_id"] = cls._clean(item.get("id")) or None
+        return state
+
+    def debug_auth_state(self, raw_key: str) -> dict[str, object]:
+        candidate = self._clean(raw_key)
+        candidate_hash = _hash_key(candidate) if candidate else ""
+        with self._lock:
+            memory_items = [dict(item) for item in self._items]
+
+        state: dict[str, object] = {
+            "memory": self._debug_items_state(memory_items, candidate_hash),
+        }
+        try:
+            raw_storage_items = self.storage.load_auth_keys()
+            storage_items = [
+                normalized
+                for item in raw_storage_items
+                if (normalized := self._normalize_item(item)) is not None
+            ] if isinstance(raw_storage_items, list) else []
+            storage_state = self._debug_items_state(storage_items, candidate_hash)
+            storage_state["raw_total"] = len(raw_storage_items) if isinstance(raw_storage_items, list) else None
+            state["storage"] = storage_state
+        except Exception as exc:
+            state["storage"] = {
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        return state
+
     @staticmethod
     def _public_item(item: dict[str, object]) -> dict[str, object]:
         quota = AuthService._coerce_non_negative_int(item.get("quota"), 0)
