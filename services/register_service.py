@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -16,6 +17,8 @@ from services.register import mail_provider, openai_register
 REGISTER_FILE = DATA_DIR / "register.json"
 SCHEDULER_WAIT_SECONDS = 5.0
 MIN_WORKER_TIMEOUT_SECONDS = 30 * 60
+STATS_SAVE_INTERVAL_SECONDS = 15.0
+SAVE_ERROR_LOG_INTERVAL_SECONDS = 60.0
 
 
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
@@ -67,6 +70,8 @@ class RegisterService:
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
         self._logs: list[dict] = []
+        self._last_stats_save_at = 0.0
+        self._last_save_error_log_at = 0.0
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
         if self._config["enabled"]:
@@ -78,9 +83,20 @@ class RegisterService:
         except Exception:
             return _normalize({})
 
-    def _save(self) -> None:
-        self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        self._store_file.write_text(json.dumps(self._config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    def _save(self) -> bool:
+        try:
+            self._store_file.parent.mkdir(parents=True, exist_ok=True)
+            self._store_file.write_text(json.dumps(self._config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            return True
+        except OSError as exc:
+            now = time.monotonic()
+            if now - self._last_save_error_log_at >= SAVE_ERROR_LOG_INTERVAL_SECONDS:
+                self._last_save_error_log_at = now
+                message = f"保存注册状态失败: {exc}；调度器会继续运行"
+                self._logs.append({"time": _now(), "text": message, "level": "red"})
+                self._logs = self._logs[-300:]
+                print(f"[register-service] {message}")
+            return False
 
     def get(self) -> dict:
         with self._lock:
@@ -252,7 +268,15 @@ class RegisterService:
             return reached
         return submitted >= int(cfg.get("total") or 1)
 
-    def _bump(self, **updates) -> None:
+    @staticmethod
+    def _open_fd_count() -> int | None:
+        proc_fd = "/proc/self/fd"
+        try:
+            return len(os.listdir(proc_fd)) if os.path.isdir(proc_fd) else None
+        except OSError:
+            return None
+
+    def _bump(self, force_save: bool = False, **updates) -> None:
         with self._lock:
             self._config["stats"].update(updates)
             stats = self._config["stats"]
@@ -269,7 +293,13 @@ class RegisterService:
                 stats["avg_seconds"] = round(elapsed / success, 1) if success else 0
                 stats["success_rate"] = round(success * 100 / max(1, success + fail), 1)
             self._config["stats"]["updated_at"] = _now()
-            self._save()
+            open_fds = self._open_fd_count()
+            if open_fds is not None:
+                self._config["stats"]["open_fds"] = open_fds
+            now = time.monotonic()
+            if force_save or now - self._last_stats_save_at >= STATS_SAVE_INTERVAL_SECONDS:
+                if self._save():
+                    self._last_stats_save_at = now
 
     @staticmethod
     def _positive_float(value: object, default: float) -> float:
@@ -359,7 +389,7 @@ class RegisterService:
             self._append_log(f"注册调度异常退出: {exc}", "red")
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
-            self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
+            self._bump(force_save=True, running=0, done=done, success=success, fail=fail, finished_at=_now())
             with self._lock:
                 self._config["enabled"] = False
                 self._save()

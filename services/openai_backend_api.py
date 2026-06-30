@@ -325,7 +325,9 @@ class OpenAIBackendAPI:
             executor.shutdown(wait=False, cancel_futures=True)
             raise
         except BaseException:
-            executor.shutdown(wait=False, cancel_futures=True)
+            # 任一请求先失败时，另外两个请求可能仍在占用 socket/DNS 资源。
+            # 等它们按各自 timeout 退出，避免持续刷新后堆积后台线程和文件描述符。
+            executor.shutdown(wait=True, cancel_futures=True)
             raise
         else:
             executor.shutdown(wait=True, cancel_futures=True)
