@@ -132,6 +132,7 @@ class EditableFileTaskService:
         account_email = ""
         backend = None
         self._update_task(key, status=TASK_STATUS_RUNNING, error="", started_ts=started)
+        backend = None
         try:
             if kind == "psd" and not base64_images:
                 raise ValueError("base64_images is empty")

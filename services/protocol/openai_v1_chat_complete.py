@@ -50,6 +50,28 @@ def close_backend(backend: object) -> None:
         close()
 
 
+def normalize_thinking_effort(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"", "none"}:
+        return ""
+    if normalized in {"low", "medium", "high"}:
+        return normalized
+    if normalized in {"xhigh", "extended"}:
+        return "extended"
+    return ""
+
+
+def thinking_effort_from_body(body: dict[str, Any]) -> str:
+    if "thinking_effort" in body:
+        return normalize_thinking_effort(body.get("thinking_effort"))
+    if "reasoning_effort" in body:
+        return normalize_thinking_effort(body.get("reasoning_effort"))
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        return normalize_thinking_effort(reasoning.get("effort"))
+    return ""
+
+
 def completion_chunk(model: str, delta: dict[str, Any], finish_reason: str | None = None, completion_id: str = "", created: int | None = None) -> dict[str, Any]:
     return {
         "id": completion_id or f"chatcmpl-{uuid.uuid4().hex}",
@@ -102,11 +124,16 @@ def completion_response(
     }
 
 
-def stream_text_chat_completion(backend, messages: list[dict[str, Any]], model: str) -> Iterator[dict[str, Any]]:
+def stream_text_chat_completion(
+    backend,
+    messages: list[dict[str, Any]],
+    model: str,
+    thinking_effort: str = "",
+) -> Iterator[dict[str, Any]]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     sent_role = False
-    request = ConversationRequest(model=model, messages=messages)
+    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
     try:
         for delta_text in stream_text_deltas(backend, request):
             if not sent_role:
@@ -133,12 +160,12 @@ def collect_chat_content(chunks: Iterable[dict[str, Any]]) -> str:
     return "".join(parts)
 
 
-def collect_text_response(model: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
+def collect_text_response(model: str, messages: list[dict[str, Any]], thinking_effort: str = "") -> dict[str, Any]:
     backend = text_backend()
     try:
         return completion_response(
             model,
-            collect_text(backend, ConversationRequest(model=model, messages=messages)),
+            collect_text(backend, ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)),
             messages=messages,
         )
     finally:
@@ -287,18 +314,20 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         model, messages = text_chat_parts(body)
         if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
             return stream_web_search_chat_completion(messages, model)
+        thinking_effort = thinking_effort_from_body(body)
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_chat_completion(text_backend(), messages, model),
+            lambda: stream_text_chat_completion(text_backend(), messages, model, thinking_effort),
         )
     if is_image_chat_request(body):
         return image_chat_response(body)
     model, messages = text_chat_parts(body)
     if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         return web_search_chat_response(messages, model)
+    thinking_effort = thinking_effort_from_body(body)
     key = cache_key(body, messages, stream=False)
     return chat_completion_cache.get_or_compute_response(
         key,
-        lambda: collect_text_response(model, messages),
+        lambda: collect_text_response(model, messages, thinking_effort),
     )

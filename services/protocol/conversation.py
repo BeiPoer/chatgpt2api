@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -297,6 +298,7 @@ class ConversationRequest:
     model: str = "auto"
     prompt: str = ""
     messages: list[dict[str, Any]] | None = None
+    thinking_effort: str = ""
     images: list[str] | None = None
     n: int = 1
     size: str | None = None
@@ -655,6 +657,7 @@ def conversation_events(
     images: list[str] | None = None,
     size: str | None = None,
     quality: str = "auto",
+    thinking_effort: str = "",
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
@@ -667,6 +670,7 @@ def conversation_events(
         prompt=final_prompt,
         images=images if image_model else None,
         system_hints=["picture_v2"] if image_model else None,
+        thinking_effort=thinking_effort if not image_model else "",
     )
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
 
@@ -684,18 +688,22 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             raise RuntimeError("no available text account")
         if token:
             attempted_tokens.add(token)
+        active_backend = None
         try:
             active_backend = OpenAIBackendAPI(access_token=token)
-            try:
-                for event in conversation_events(active_backend, messages=request.messages, model=request.model, prompt=request.prompt):
-                    if event.get("type") != "conversation.delta":
-                        continue
-                    delta = str(event.get("delta") or "")
-                    if delta:
-                        emitted = True
-                        yield delta
-            finally:
-                active_backend.close()
+            for event in conversation_events(
+                active_backend,
+                messages=request.messages,
+                model=request.model,
+                prompt=request.prompt,
+                thinking_effort=request.thinking_effort,
+            ):
+                if event.get("type") != "conversation.delta":
+                    continue
+                delta = str(event.get("delta") or "")
+                if delta:
+                    emitted = True
+                    yield delta
             account_service.mark_text_used(token)
             return
         except Exception as exc:
@@ -710,6 +718,9 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 if token:
                     continue
             raise
+        finally:
+            if active_backend is not None:
+                active_backend.close()
 
 
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:
@@ -763,6 +774,24 @@ def _get_detailed_error_from_tasks(
             "error": str(exc),
         })
         return ""
+
+
+def _remove_image_conversation_later(backend: OpenAIBackendAPI, conversation_id: str) -> None:
+    if not config.image_remove_conversation_after_result or not conversation_id:
+        return
+
+    def _run() -> None:
+        try:
+            backend.delete_conversation(conversation_id)
+            logger.info({"event": "image_conversation_removed", "conversation_id": conversation_id})
+        except Exception as exc:
+            logger.warning({
+                "event": "image_conversation_remove_failed",
+                "conversation_id": conversation_id,
+                "error": str(exc),
+            })
+
+    threading.Thread(target=_run, name=f"remove-image-conversation-{conversation_id}", daemon=True).start()
 
 
 def stream_image_outputs(
@@ -941,6 +970,7 @@ def stream_image_outputs(
             int(time.time()),
         )["data"]
         if data:
+            _remove_image_conversation_later(backend, conversation_id)
             yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
         return
 
@@ -1038,6 +1068,7 @@ def stream_image_outputs(
                         int(time.time()),
                     )["data"]
                     if data:
+                        _remove_image_conversation_later(backend, conversation_id)
                         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
                         return
         elif is_text_reply:
@@ -1150,6 +1181,7 @@ def stream_image_outputs(
                     int(time.time()),
                 )["data"]
                 if data:
+                    _remove_image_conversation_later(backend, conversation_id)
                     yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
                     return
         
