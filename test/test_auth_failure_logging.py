@@ -5,11 +5,12 @@ from unittest import TestCase, mock
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from api.errors import install_exception_handlers
+from api.support import require_identity
 from services.log_service import LOG_TYPE_ACCOUNT
 
 
@@ -28,8 +29,8 @@ class AuthFailureLoggingTests(TestCase):
         }
         token = "sk-secret-value"
         with (
-            mock.patch("api.errors.auth_service.debug_auth_state", return_value=auth_state),
-            mock.patch("api.errors.log_service.add") as add_log,
+            mock.patch("api.auth_diagnostics.auth_service.debug_auth_state", return_value=auth_state),
+            mock.patch("api.auth_diagnostics.log_service.add") as add_log,
             mock.patch("builtins.print"),
         ):
             response = TestClient(app).get(
@@ -66,8 +67,8 @@ class AuthFailureLoggingTests(TestCase):
             return JSONResponse(status_code=401, content={"detail": "nope"})
 
         with (
-            mock.patch("api.errors.auth_service.debug_auth_state", return_value={"memory": {}, "storage": {}}),
-            mock.patch("api.errors.log_service.add") as add_log,
+            mock.patch("api.auth_diagnostics.auth_service.debug_auth_state", return_value={"memory": {}, "storage": {}}),
+            mock.patch("api.auth_diagnostics.log_service.add") as add_log,
             mock.patch("builtins.print"),
         ):
             response = TestClient(app).get("/plain-401", headers={"Authorization": "Bearer wrong"})
@@ -78,3 +79,31 @@ class AuthFailureLoggingTests(TestCase):
         self.assertEqual(summary, "鉴权失败 401")
         self.assertEqual(detail["path"], "/plain-401")
         self.assertEqual(detail["log_source"], "response_middleware")
+
+    def test_require_identity_logs_before_raising(self) -> None:
+        app = FastAPI()
+        install_exception_handlers(app)
+
+        @app.get("/v1/guarded")
+        async def guarded(authorization: str | None = Header(default=None)):
+            require_identity(authorization)
+            return {"ok": True}
+
+        auth_state = {
+            "memory": {"candidate_match": "none"},
+            "storage": {"candidate_match": "none"},
+        }
+        with (
+            mock.patch("api.auth_diagnostics.auth_service.debug_auth_state", return_value=auth_state),
+            mock.patch("api.auth_diagnostics.log_service.add") as add_log,
+            mock.patch("builtins.print"),
+        ):
+            response = TestClient(app).get("/v1/guarded", headers={"Authorization": "Bearer wrong"})
+
+        self.assertEqual(response.status_code, 401)
+        add_log.assert_called_once()
+        _, summary, detail = add_log.call_args.args
+        self.assertEqual(summary, "鉴权失败 401")
+        self.assertEqual(detail["path"], "/v1/guarded")
+        self.assertEqual(detail["log_source"], "require_identity")
+        self.assertEqual(detail["diagnostic_token_auth_state"], auth_state)
