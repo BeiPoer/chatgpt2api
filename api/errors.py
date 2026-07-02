@@ -55,7 +55,10 @@ def _auth_state_for(token: str) -> dict[str, object] | None:
         return {"error": f"{type(exc).__name__}: {exc}"}
 
 
-def _log_unauthorized_request(request: Request, detail: object) -> None:
+def _log_unauthorized_request(request: Request, detail: object, *, source: str) -> None:
+    if bool(getattr(request.state, "auth_failure_logged", False)):
+        return
+    request.state.auth_failure_logged = True
     authorization = _safe_header(request, "authorization")
     scheme, bearer_token = _extract_bearer_token(authorization)
     x_api_key = _safe_header(request, "x-api-key")
@@ -63,6 +66,7 @@ def _log_unauthorized_request(request: Request, detail: object) -> None:
     query_keys = sorted(set(request.query_params.keys()))
     diagnostic: dict[str, object] = {
         "status_code": 401,
+        "log_source": source,
         "error": error_message_from_detail(detail) or "unauthorized",
         "method": request.method,
         "path": request.url.path,
@@ -108,11 +112,12 @@ def _log_unauthorized_request(request: Request, detail: object) -> None:
 
     try:
         log_service.add(LOG_TYPE_ACCOUNT, "鉴权失败 401", diagnostic)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[auth] 401 log write failed: {type(exc).__name__}: {exc}", flush=True)
 
     print(
         "[auth] 401 "
+        f"source={source} "
         f"path={request.url.path} "
         f"method={request.method} "
         f"client={diagnostic['client_host']} "
@@ -138,10 +143,17 @@ def _compatible_error_response(
 
 
 def install_exception_handlers(app: FastAPI) -> None:
+    @app.middleware("http")
+    async def unauthorized_response_logger(request: Request, call_next):
+        response = await call_next(request)
+        if response.status_code == 401:
+            _log_unauthorized_request(request, {"error": "401 response"}, source="response_middleware")
+        return response
+
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
         if exc.status_code == 401:
-            _log_unauthorized_request(request, exc.detail)
+            _log_unauthorized_request(request, exc.detail, source="exception_handler")
         if _is_openai_compatible_path(request.url.path):
             return _compatible_error_response(request, exc.detail, exc.status_code, exc.headers)
         return JSONResponse(

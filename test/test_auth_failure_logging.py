@@ -6,6 +6,7 @@ from unittest import TestCase, mock
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from api.errors import install_exception_handlers
@@ -47,6 +48,7 @@ class AuthFailureLoggingTests(TestCase):
         self.assertEqual(log_type, LOG_TYPE_ACCOUNT)
         self.assertEqual(summary, "鉴权失败 401")
         self.assertEqual(detail["path"], "/v1/probe")
+        self.assertEqual(detail["log_source"], "exception_handler")
         self.assertEqual(detail["query_keys"], ["foo", "secret"])
         self.assertEqual(detail["authorization_present"], True)
         self.assertEqual(detail["authorization_scheme"], "Bearer")
@@ -54,3 +56,25 @@ class AuthFailureLoggingTests(TestCase):
         self.assertEqual(detail["diagnostic_token_source"], "authorization_bearer")
         self.assertEqual(detail["diagnostic_token_auth_state"], auth_state)
         self.assertNotIn(token, str(detail))
+
+    def test_direct_unauthorized_response_is_logged(self) -> None:
+        app = FastAPI()
+        install_exception_handlers(app)
+
+        @app.get("/plain-401")
+        async def plain_401():
+            return JSONResponse(status_code=401, content={"detail": "nope"})
+
+        with (
+            mock.patch("api.errors.auth_service.debug_auth_state", return_value={"memory": {}, "storage": {}}),
+            mock.patch("api.errors.log_service.add") as add_log,
+            mock.patch("builtins.print"),
+        ):
+            response = TestClient(app).get("/plain-401", headers={"Authorization": "Bearer wrong"})
+
+        self.assertEqual(response.status_code, 401)
+        add_log.assert_called_once()
+        _, summary, detail = add_log.call_args.args
+        self.assertEqual(summary, "鉴权失败 401")
+        self.assertEqual(detail["path"], "/plain-401")
+        self.assertEqual(detail["log_source"], "response_middleware")
