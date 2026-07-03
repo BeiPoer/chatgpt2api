@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from threading import Event, Thread
+from typing import Callable
 
 from fastapi import HTTPException, Request
 
@@ -82,6 +84,18 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
     return [sanitized for server in servers if (sanitized := sanitize_sub2api_server(server)) is not None]
 
 
+def _wait_for_configured_interval(stop_event: Event, interval_minutes: Callable[[], int]) -> bool:
+    started_at = time.monotonic()
+    while not stop_event.is_set():
+        interval_seconds = max(1, int(interval_minutes())) * 60
+        elapsed = time.monotonic() - started_at
+        if elapsed >= interval_seconds:
+            return False
+        if stop_event.wait(min(30, interval_seconds - elapsed)):
+            return True
+    return True
+
+
 def start_limited_account_watcher(stop_event: Event) -> Thread:
     interval_seconds = config.refresh_account_interval_minute * 60
 
@@ -113,6 +127,28 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
             stop_event.wait(interval_seconds)
 
     thread = Thread(target=worker, name="account-watcher", daemon=True)
+    thread.start()
+    return thread
+
+
+def start_all_accounts_refresh_watcher(stop_event: Event) -> Thread:
+    def worker() -> None:
+        while not _wait_for_configured_interval(
+            stop_event,
+            lambda: config.auto_refresh_all_accounts_interval_minute,
+        ):
+            try:
+                tokens = account_service.list_tokens()
+                if not tokens:
+                    continue
+                print(f"[account-all-refresh] refreshing {len(tokens)} accounts")
+                result = account_service.refresh_accounts(tokens, defer_invalid_removal=False)
+                if result.get("errors"):
+                    print(f"[account-all-refresh] errors: {result['errors']}")
+            except Exception as exc:
+                print(f"[account-all-refresh] fail {exc}")
+
+    thread = Thread(target=worker, name="account-all-refresh-watcher", daemon=True)
     thread.start()
     return thread
 

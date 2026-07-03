@@ -58,6 +58,27 @@ class ConfigLoadingTests(unittest.TestCase):
                 else:
                     module.os.environ["CHATGPT2API_AUTH_KEY"] = old_env_auth_key
 
+    def test_auto_refresh_all_accounts_interval_defaults_to_ten_and_normalizes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            module = self.config_module
+            config_path = Path(tmp_dir) / "config.json"
+            config_path.write_text(json.dumps({"auth-key": "test-auth"}), encoding="utf-8")
+            store = module.ConfigStore(config_path)
+
+            self.assertEqual(store.get()["auto_refresh_all_accounts_interval_minute"], 10)
+            self.assertEqual(
+                store.update({"auto_refresh_all_accounts_interval_minute": 0})[
+                    "auto_refresh_all_accounts_interval_minute"
+                ],
+                1,
+            )
+            self.assertEqual(
+                store.update({"auto_refresh_all_accounts_interval_minute": "bad"})[
+                    "auto_refresh_all_accounts_interval_minute"
+                ],
+                10,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
