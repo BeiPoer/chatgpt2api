@@ -794,6 +794,29 @@ def _remove_image_conversation_later(backend: OpenAIBackendAPI, conversation_id:
     threading.Thread(target=_run, name=f"remove-image-conversation-{conversation_id}", daemon=True).start()
 
 
+def _delete_image_timeout_account(
+        access_token: str,
+        account_email: str,
+        error: Exception,
+        index: int,
+) -> int:
+    if not access_token:
+        return 0
+    account_service.release_image_slot(access_token)
+    result = account_service.delete_accounts([access_token])
+    removed = int(result.get("removed") or 0)
+    logger.warning({
+        "event": "image_poll_timeout_account_deleted" if removed else "image_poll_timeout_account_delete_missed",
+        "request_token": access_token,
+        "account_email": account_email,
+        "index": index,
+        "removed": removed,
+        "conversation_id": getattr(error, "conversation_id", ""),
+        "error": str(error)[:200],
+    })
+    return removed
+
+
 def stream_image_outputs(
         backend: OpenAIBackendAPI,
         request: ConversationRequest,
@@ -1263,7 +1286,7 @@ def _generate_single_image(
     MAX_TLS_RETRIES = 3
     # 连接超时错误最大重试次数（同账号短等待重试）
     MAX_CONN_TIMEOUT_RETRIES = 3
-    # 轮询超时错误最大重试次数（换账号重试）
+    # 轮询超时错误最大重试次数（删除超时账号后换账号重试）
     MAX_POLL_TIMEOUT_RETRIES = 4
 
     text_reply_retry_count = 0
@@ -1340,30 +1363,41 @@ def _generate_single_image(
             account_service.mark_image_result(token, True)
             return outputs
         except ImagePollTimeoutError as exc:
-            account_service.mark_image_result(token, False)
             if account_email:
                 setattr(exc, "account_email", account_email)
-            # 轮询超时：换账号重试
-            if not emitted_for_token:
-                poll_timeout_retry_count += 1
-                if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
-                    logger.warning({
-                        "event": "image_poll_timeout_retry",
-                        "request_token": token,
-                        "account_email": account_email,
-                        "retry_count": poll_timeout_retry_count,
-                        "index": index,
-                        "error": str(exc)[:200],
-                    })
-                    continue
+            try:
+                _delete_image_timeout_account(token, account_email, exc, index)
+            except Exception as delete_exc:
                 logger.warning({
-                    "event": "image_poll_timeout_exhausted_retries",
+                    "event": "image_poll_timeout_account_delete_failed",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "index": index,
+                    "delete_error": str(delete_exc)[:200],
+                    "error": str(exc)[:200],
+                })
+                raise
+            # 轮询超时：删除当前账号后换账号重试。_generate_single_image 会先缓冲输出，
+            # 所以上游进度事件不会提前发给客户端，可以安全换号。
+            poll_timeout_retry_count += 1
+            if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
+                logger.warning({
+                    "event": "image_poll_timeout_retry",
                     "request_token": token,
                     "account_email": account_email,
                     "retry_count": poll_timeout_retry_count,
                     "index": index,
+                    "had_upstream_events": emitted_for_token,
+                    "error": str(exc)[:200],
                 })
-                raise
+                continue
+            logger.warning({
+                "event": "image_poll_timeout_exhausted_retries",
+                "request_token": token,
+                "account_email": account_email,
+                "retry_count": poll_timeout_retry_count,
+                "index": index,
+            })
             raise
         except ImageContentPolicyError as exc:
             account_service.mark_image_result(token, False)

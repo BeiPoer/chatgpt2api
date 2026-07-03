@@ -1181,6 +1181,7 @@ class AccountService:
             removed = sum(self._accounts.pop(token, None) is not None for token in target_set)
             for token in target_set:
                 self._image_inflight.pop(token, None)
+            self._image_slot_condition.notify_all()
             self._token_aliases = {
                 old: new
                 for old, new in self._token_aliases.items()
