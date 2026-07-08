@@ -940,7 +940,7 @@ def stream_image_outputs(
     # 因为上游可能将图片生成作为异步任务执行，SSE 流在工具完成前就断开了，
     # 导致对话文档中尚未写入图片工具的响应记录。
     poll_timeout = config.image_poll_timeout_secs
-    if is_text_reply and conversation_id:
+    if is_text_reply and conversation_id and config.image_poll_timeout_retry_enabled:
         # 文本回复场景下图片可能仍在异步生成，使用更长超时（默认 120s → 额外 180s = 300s）
         poll_timeout = max(poll_timeout, 300)
         logger.info({
@@ -1020,7 +1020,7 @@ def stream_image_outputs(
                     "event": "image_text_reply_conversation_id_recovery_failed",
                     "error": repr(exc)[:300],
                 })
-        if is_text_reply and conversation_id:
+        if is_text_reply and conversation_id and config.image_poll_timeout_retry_enabled:
             logger.info({
                 "event": "image_model_text_reply_retry_poll",
                 "conversation_id": conversation_id,
@@ -1130,7 +1130,7 @@ def stream_image_outputs(
                 "event": "image_fallback_conversation_id_recovery_failed",
                 "error": repr(exc)[:300],
             })
-    if should_poll_for_image and conversation_id:
+    if should_poll_for_image and conversation_id and config.image_poll_timeout_retry_enabled:
         # 图片可能仍在异步处理中（上游 SSE 流在图片生成完成前就结束了）。
         # 使用 300s 超时并允许多次重试，避免因临时网络问题或图片尚未提交而提前退出。
         retry_poll_timeout = max(config.image_poll_timeout_secs, 300)

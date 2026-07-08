@@ -54,6 +54,19 @@ class FakeBackend:
         self.closed = True
 
 
+class FakeFallbackBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__("timeout-token")
+        self.retry_polls = 0
+
+    def resolve_conversation_image_urls(self, *args, **kwargs) -> list[str]:
+        return []
+
+    def _poll_image_results(self, *args, **kwargs):
+        self.retry_polls += 1
+        raise ImagePollTimeoutError("ChatGPT 生图超时（已等待 1 秒）。")
+
+
 class ImagePollTimeoutAccountDeletionTests(unittest.TestCase):
     def test_poll_timeout_deletes_account_and_retries_after_progress(self) -> None:
         account_service = FakeAccountService()
@@ -131,6 +144,31 @@ class ImagePollTimeoutAccountDeletionTests(unittest.TestCase):
         self.assertEqual(account_service.marked, [("timeout-token", False)])
         self.assertIn("超时", str(caught.exception))
         self.assertEqual(caught.exception.conversation_id, "conv-timeout")
+
+    def test_disabled_retry_skips_fallback_retry_poll(self) -> None:
+        backend = FakeFallbackBackend()
+
+        def fake_conversation_events(*args, **kwargs):
+            yield {
+                "type": "conversation.done",
+                "conversation_id": "conv-timeout",
+                "file_ids": [],
+                "sediment_ids": [],
+                "text": "",
+                "turn_use_case": "image gen",
+            }
+
+        with (
+            mock.patch.object(conversation, "conversation_events", fake_conversation_events),
+            mock.patch.dict(conversation.config.data, {"image_poll_timeout_retry_enabled": False}),
+        ):
+            outputs = list(conversation.stream_image_outputs(
+                backend,
+                conversation.ConversationRequest(prompt="cat", model="gpt-image-2"),
+            ))
+
+        self.assertEqual(backend.retry_polls, 0)
+        self.assertEqual([output.kind for output in outputs], ["message"])
 
 
 if __name__ == "__main__":
