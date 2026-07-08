@@ -1365,6 +1365,13 @@ def _generate_single_image(
         except ImagePollTimeoutError as exc:
             if account_email:
                 setattr(exc, "account_email", account_email)
+            if not config.image_poll_timeout_retry_enabled:
+                account_service.mark_image_result(token, False)
+                raise ImageGenerationError(
+                    str(exc) or "image generation timed out",
+                    account_email=account_email,
+                    conversation_id=getattr(exc, "conversation_id", ""),
+                ) from exc
             try:
                 _delete_image_timeout_account(token, account_email, exc, index)
             except Exception as delete_exc:

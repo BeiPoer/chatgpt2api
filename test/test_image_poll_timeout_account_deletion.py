@@ -98,6 +98,40 @@ class ImagePollTimeoutAccountDeletionTests(unittest.TestCase):
         self.assertEqual([output.kind for output in outputs], ["result"])
         self.assertEqual(outputs[0].account_email, "success@example.test")
 
+    def test_poll_timeout_retry_can_be_disabled(self) -> None:
+        account_service = FakeAccountService()
+
+        def fake_stream_image_outputs(backend, request, index=1, total=1):
+            yield conversation.ImageOutput(
+                kind="progress",
+                model=request.model,
+                index=index,
+                total=total,
+                text="upstream started",
+                conversation_id="conv-timeout",
+            )
+            exc = ImagePollTimeoutError("ChatGPT 生图超时（已等待 1 秒）。")
+            setattr(exc, "conversation_id", "conv-timeout")
+            raise exc
+
+        with (
+            mock.patch.object(conversation, "account_service", account_service),
+            mock.patch.object(conversation, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation, "stream_image_outputs", fake_stream_image_outputs),
+            mock.patch.dict(conversation.config.data, {"image_poll_timeout_retry_enabled": False}),
+        ):
+            with self.assertRaises(conversation.ImageGenerationError) as caught:
+                conversation._generate_single_image(
+                    conversation.ConversationRequest(prompt="cat", model="gpt-image-2"),
+                    1,
+                    1,
+                )
+
+        self.assertEqual(account_service.deleted, [])
+        self.assertEqual(account_service.marked, [("timeout-token", False)])
+        self.assertIn("超时", str(caught.exception))
+        self.assertEqual(caught.exception.conversation_id, "conv-timeout")
+
 
 if __name__ == "__main__":
     unittest.main()
