@@ -68,6 +68,11 @@ class FakeFallbackBackend(FakeBackend):
 
 
 class ImagePollTimeoutAccountDeletionTests(unittest.TestCase):
+    def test_http2_stream_error_is_connection_error(self) -> None:
+        self.assertTrue(conversation.is_tls_connection_error(
+            "Failed to perform, curl: (92) HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR"
+        ))
+
     def test_poll_timeout_deletes_account_and_retries_after_progress(self) -> None:
         account_service = FakeAccountService()
 
@@ -169,6 +174,73 @@ class ImagePollTimeoutAccountDeletionTests(unittest.TestCase):
 
         self.assertEqual(backend.retry_polls, 0)
         self.assertEqual([output.kind for output in outputs], ["message"])
+
+    def test_generation_retry_stops_at_image_timeout_budget(self) -> None:
+        account_service = FakeAccountService()
+        calls = 0
+
+        def fake_stream_image_outputs(backend, request, index=1, total=1):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError(
+                "Failed to perform, curl: (92) HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR"
+            )
+
+        with (
+            mock.patch.object(conversation, "account_service", account_service),
+            mock.patch.object(conversation, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation, "stream_image_outputs", fake_stream_image_outputs),
+            mock.patch.dict(conversation.config.data, {"image_poll_timeout_secs": 1, "image_poll_timeout_retry_enabled": True}),
+            mock.patch.object(conversation.time, "monotonic", side_effect=[0.0, 0.1, 2.0]),
+            mock.patch.object(conversation.time, "sleep"),
+        ):
+            with self.assertRaises(conversation.ImageGenerationError) as caught:
+                conversation._generate_single_image(
+                    conversation.ConversationRequest(prompt="cat", model="gpt-image-2"),
+                    1,
+                    1,
+                )
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(str(caught.exception), "image generation timed out")
+
+    def test_generation_progress_stream_stops_at_image_timeout_budget(self) -> None:
+        account_service = FakeAccountService()
+
+        def fake_stream_image_outputs(backend, request, index=1, total=1):
+            yield conversation.ImageOutput(
+                kind="progress",
+                model=request.model,
+                index=index,
+                total=total,
+                text="still working",
+                conversation_id="conv-timeout",
+            )
+            yield conversation.ImageOutput(
+                kind="progress",
+                model=request.model,
+                index=index,
+                total=total,
+                text="still working",
+                conversation_id="conv-timeout",
+            )
+
+        with (
+            mock.patch.object(conversation, "account_service", account_service),
+            mock.patch.object(conversation, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation, "stream_image_outputs", fake_stream_image_outputs),
+            mock.patch.dict(conversation.config.data, {"image_poll_timeout_secs": 1}),
+            mock.patch.object(conversation.time, "monotonic", side_effect=[0.0, 0.1, 0.2, 2.0]),
+        ):
+            with self.assertRaises(conversation.ImageGenerationError) as caught:
+                conversation._generate_single_image(
+                    conversation.ConversationRequest(prompt="cat", model="gpt-image-2"),
+                    1,
+                    1,
+                )
+
+        self.assertEqual(str(caught.exception), "image generation timed out")
+        self.assertEqual(caught.exception.conversation_id, "conv-timeout")
 
 
 if __name__ == "__main__":

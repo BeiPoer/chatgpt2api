@@ -82,6 +82,9 @@ def is_tls_connection_error(message: str) -> bool:
     text = str(message or "").lower()
     return (
         "curl: (35)" in text
+        or "curl: (92)" in text
+        or "http/2 stream" in text
+        or "internal_error" in text
         or "tls connect error" in text
         or "openssl_internal" in text
         or "ssl: wrong_version_number" in text
@@ -1294,8 +1297,14 @@ def _generate_single_image(
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
     account_email = ""
+    started_at = time.monotonic()
+
+    def image_timeout_budget_exhausted() -> bool:
+        return time.monotonic() - started_at >= config.image_poll_timeout_secs
 
     while True:
+        if image_timeout_budget_exhausted():
+            raise ImageGenerationError("image generation timed out", account_email=account_email)
         try:
             if request.progress_callback:
                 request.progress_callback("getting_account")
@@ -1329,6 +1338,12 @@ def _generate_single_image(
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
             outputs: list[ImageOutput] = []
             for output in stream_fn(backend, request, index, total):
+                if image_timeout_budget_exhausted():
+                    raise ImageGenerationError(
+                        "image generation timed out",
+                        account_email=account_email,
+                        conversation_id=output.conversation_id,
+                    )
                 if account_email and not output.account_email:
                     output.account_email = account_email
                 if output.kind == "message" and request.message_as_error:
