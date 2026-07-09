@@ -14,7 +14,12 @@ import tiktoken
 from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
-from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.openai_backend_api import (
+    ImageContentPolicyError,
+    ImagePollTimeoutError,
+    ImageStreamHardTimeoutError,
+    OpenAIBackendAPI,
+)
 from utils.helper import (
     IMAGE_MODELS,
     extract_image_from_message_content,
@@ -1285,26 +1290,27 @@ def _generate_single_image(
     """
     # 模型返回文本而非图片的最大重试次数
     MAX_TEXT_REPLY_RETRIES = 3
-    # TLS 连接错误最大重试次数
-    MAX_TLS_RETRIES = 3
-    # 连接超时错误最大重试次数（同账号短等待重试）
-    MAX_CONN_TIMEOUT_RETRIES = 3
     # 轮询超时错误最大重试次数（删除超时账号后换账号重试）
     MAX_POLL_TIMEOUT_RETRIES = 4
 
     text_reply_retry_count = 0
-    tls_retry_count = 0
-    conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
     account_email = ""
     started_at = time.monotonic()
+    token = ""
 
     def image_timeout_budget_exhausted() -> bool:
         return time.monotonic() - started_at >= config.image_poll_timeout_secs
 
+    def delete_timeout_account(error: Exception) -> None:
+        if token:
+            _delete_image_timeout_account(token, account_email, error, index)
+
     while True:
         if image_timeout_budget_exhausted():
-            raise ImageGenerationError("image generation timed out", account_email=account_email)
+            exc = ImageGenerationError("image generation timed out", account_email=account_email)
+            delete_timeout_account(exc)
+            raise exc
         try:
             if request.progress_callback:
                 request.progress_callback("getting_account")
@@ -1438,11 +1444,23 @@ def _generate_single_image(
                 account_email=account_email,
                 conversation_id=getattr(exc, "conversation_id", ""),
             ) from exc
+        except ImageStreamHardTimeoutError as exc:
+            if account_email:
+                setattr(exc, "account_email", account_email)
+            delete_timeout_account(exc)
+            raise ImageGenerationError(
+                str(exc) or "image generation timed out",
+                account_email=account_email,
+                conversation_id=getattr(exc, "conversation_id", ""),
+            ) from exc
         except ImageGenerationError as exc:
             account_service.mark_image_result(token, False)
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
+            if error_text == "image generation timed out":
+                delete_timeout_account(exc)
+                raise
             # 如果是模型返回文本而非图片，尝试换账号重试
             if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
                 text_reply_retry_count += 1
@@ -1497,36 +1515,8 @@ def _generate_single_image(
                     continue
                 account_service.remove_invalid_token(token, "image_stream")
                 continue
-            # TLS/SSL 连接错误：自动重试
-            if not emitted_for_token and is_tls_connection_error(last_error):
-                tls_retry_count += 1
-                if tls_retry_count <= MAX_TLS_RETRIES:
-                    logger.warning({
-                        "event": "image_stream_tls_retry",
-                        "request_token": token,
-                        "account_email": account_email,
-                        "retry_count": tls_retry_count,
-                        "index": index,
-                        "error": last_error[:200],
-                    })
-                    time.sleep(min(2.0 * tls_retry_count, 10.0))
-                    continue
-            # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
-            if not emitted_for_token and is_connection_timeout_error(last_error):
-                conn_timeout_retry_count += 1
-                if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
-                    wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)
-                    logger.warning({
-                        "event": "image_stream_conn_timeout_retry",
-                        "request_token": token,
-                        "account_email": account_email,
-                        "retry_count": conn_timeout_retry_count,
-                        "index": index,
-                        "wait_secs": wait_secs,
-                        "error": last_error[:200],
-                    })
-                    time.sleep(wait_secs)
-                    continue
+            if is_tls_connection_error(last_error) or is_connection_timeout_error(last_error):
+                delete_timeout_account(exc)
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
         finally:
             if backend is not None:

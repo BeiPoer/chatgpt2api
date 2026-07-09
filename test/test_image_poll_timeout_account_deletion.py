@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from services.openai_backend_api import ImagePollTimeoutError
+from services.openai_backend_api import ImagePollTimeoutError, ImageStreamHardTimeoutError
 from services.protocol import conversation
 
 
@@ -175,7 +175,7 @@ class ImagePollTimeoutAccountDeletionTests(unittest.TestCase):
         self.assertEqual(backend.retry_polls, 0)
         self.assertEqual([output.kind for output in outputs], ["message"])
 
-    def test_generation_retry_stops_at_image_timeout_budget(self) -> None:
+    def test_http2_stream_error_deletes_account(self) -> None:
         account_service = FakeAccountService()
         calls = 0
 
@@ -191,8 +191,6 @@ class ImagePollTimeoutAccountDeletionTests(unittest.TestCase):
             mock.patch.object(conversation, "OpenAIBackendAPI", FakeBackend),
             mock.patch.object(conversation, "stream_image_outputs", fake_stream_image_outputs),
             mock.patch.dict(conversation.config.data, {"image_poll_timeout_secs": 1, "image_poll_timeout_retry_enabled": True}),
-            mock.patch.object(conversation.time, "monotonic", side_effect=[0.0, 0.1, 2.0]),
-            mock.patch.object(conversation.time, "sleep"),
         ):
             with self.assertRaises(conversation.ImageGenerationError) as caught:
                 conversation._generate_single_image(
@@ -202,7 +200,50 @@ class ImagePollTimeoutAccountDeletionTests(unittest.TestCase):
                 )
 
         self.assertEqual(calls, 1)
-        self.assertEqual(str(caught.exception), "image generation timed out")
+        self.assertEqual(account_service.deleted, ["timeout-token"])
+        self.assertEqual(str(caught.exception), "upstream image connection failed, please retry later")
+
+    def test_stream_hard_timeout_deletes_account(self) -> None:
+        account_service = FakeAccountService()
+
+        def fake_stream_image_outputs(backend, request, index=1, total=1):
+            raise ImageStreamHardTimeoutError("图片生成流超时（已等待 1 秒），已强制中断。")
+
+        with (
+            mock.patch.object(conversation, "account_service", account_service),
+            mock.patch.object(conversation, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation, "stream_image_outputs", fake_stream_image_outputs),
+        ):
+            with self.assertRaises(conversation.ImageGenerationError) as caught:
+                conversation._generate_single_image(
+                    conversation.ConversationRequest(prompt="cat", model="gpt-image-2"),
+                    1,
+                    1,
+                )
+
+        self.assertEqual(account_service.deleted, ["timeout-token"])
+        self.assertIn("超时", str(caught.exception))
+
+    def test_connection_timeout_deletes_account(self) -> None:
+        account_service = FakeAccountService()
+
+        def fake_stream_image_outputs(backend, request, index=1, total=1):
+            raise RuntimeError("Failed to perform, curl: (28) Operation timed out")
+
+        with (
+            mock.patch.object(conversation, "account_service", account_service),
+            mock.patch.object(conversation, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation, "stream_image_outputs", fake_stream_image_outputs),
+        ):
+            with self.assertRaises(conversation.ImageGenerationError) as caught:
+                conversation._generate_single_image(
+                    conversation.ConversationRequest(prompt="cat", model="gpt-image-2"),
+                    1,
+                    1,
+                )
+
+        self.assertEqual(account_service.deleted, ["timeout-token"])
+        self.assertEqual(str(caught.exception), "upstream connection timed out, please retry later")
 
     def test_generation_progress_stream_stops_at_image_timeout_budget(self) -> None:
         account_service = FakeAccountService()
@@ -241,6 +282,7 @@ class ImagePollTimeoutAccountDeletionTests(unittest.TestCase):
 
         self.assertEqual(str(caught.exception), "image generation timed out")
         self.assertEqual(caught.exception.conversation_id, "conv-timeout")
+        self.assertEqual(account_service.deleted, ["timeout-token"])
 
 
 if __name__ == "__main__":
