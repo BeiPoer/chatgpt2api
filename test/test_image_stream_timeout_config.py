@@ -4,7 +4,7 @@ import unittest
 from unittest import mock
 
 import services.openai_backend_api as backend_module
-from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI
+from services.openai_backend_api import ChatRequirements, ImageStreamHardTimeoutError, OpenAIBackendAPI
 
 
 class FakeResponse:
@@ -40,6 +40,31 @@ class FakeRaw:
         return b"{}"
 
 
+class FakeClosedStreamResponse:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    def iter_lines(self):
+        if self.closed:
+            raise RuntimeError("stream closed")
+        yield b"data: {}\n"
+
+
+class ImmediateTimer:
+    def __init__(self, _interval, function) -> None:
+        self.function = function
+        self.daemon = False
+
+    def start(self) -> None:
+        self.function()
+
+    def cancel(self) -> None:
+        pass
+
+
 class ImageStreamTimeoutConfigTests(unittest.TestCase):
     def _backend(self) -> OpenAIBackendAPI:
         backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
@@ -72,6 +97,17 @@ class ImageStreamTimeoutConfigTests(unittest.TestCase):
             list(backend.iter_codex_image_response_events("cat"))
 
         self.assertEqual(seen["timeout"], 200)
+
+    def test_capped_sse_reader_raises_timeout_after_forced_close(self) -> None:
+        backend = self._backend()
+        response = FakeClosedStreamResponse()
+
+        with mock.patch.object(backend_module.threading, "Timer", ImmediateTimer):
+            with self.assertRaises(ImageStreamHardTimeoutError) as caught:
+                list(backend._iter_sse_payloads_capped(response, 200))
+
+        self.assertTrue(response.closed)
+        self.assertIn("超时", str(caught.exception))
 
 
 if __name__ == "__main__":

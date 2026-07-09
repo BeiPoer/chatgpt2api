@@ -4,6 +4,7 @@ import mimetypes
 import os
 import random
 import re
+import threading
 import time
 
 import urllib.error
@@ -33,6 +34,10 @@ class InvalidAccessTokenError(RuntimeError):
 
 
 class ImagePollTimeoutError(RuntimeError):
+    pass
+
+
+class ImageStreamHardTimeoutError(RuntimeError):
     pass
 
 
@@ -2598,9 +2603,35 @@ class OpenAIBackendAPI:
         response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
         self._report_progress("generating")
         try:
-            yield from iter_sse_payloads(response)
+            yield from self._iter_sse_payloads_capped(response, float(config.image_poll_timeout_secs))
         finally:
             response.close()
+
+    def _iter_sse_payloads_capped(self, response: requests.Response, hard_cap_secs: float) -> Iterator[str]:
+        deadline = time.monotonic() + max(1.0, hard_cap_secs)
+        timed_out = False
+
+        def close_on_timeout() -> None:
+            nonlocal timed_out
+            timed_out = True
+            try:
+                response.close()
+            except Exception:
+                pass
+
+        timer = threading.Timer(max(1.0, hard_cap_secs), close_on_timeout)
+        timer.daemon = True
+        timer.start()
+        try:
+            yield from iter_sse_payloads(response)
+        except Exception as exc:
+            if timed_out or time.monotonic() >= deadline:
+                raise ImageStreamHardTimeoutError(
+                    f"图片生成流超时（已等待 {int(max(1.0, hard_cap_secs))} 秒），已强制中断。"
+                ) from exc
+            raise
+        finally:
+            timer.cancel()
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
