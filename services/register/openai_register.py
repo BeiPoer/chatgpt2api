@@ -49,10 +49,10 @@ platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ
 user_agent = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/145.0.0.0 Safari/537.36"
+    "Chrome/149.0.0.0 Safari/537.36"
 )
-sec_ch_ua = '"Google Chrome";v="145", "Not?A_Brand";v="8", "Chromium";v="145"'
-sec_ch_ua_full_version_list = '"Chromium";v="145.0.0.0", "Not:A-Brand";v="99.0.0.0", "Google Chrome";v="145.0.0.0"'
+sec_ch_ua = '"Chromium";v="149", "Not_A Brand";v="99", "Google Chrome";v="149"'
+sec_ch_ua_full_version_list = '"Chromium";v="149.0.0.0", "Not_A Brand";v="99.0.0.0", "Google Chrome";v="149.0.0.0"'
 default_timeout = 30
 print_lock = threading.Lock()
 stats_lock = threading.Lock()
@@ -265,7 +265,27 @@ from utils.sentinel import SentinelTokenGenerator, build_sentinel_token as _buil
 
 def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
     """请求 sentinel token，返回 sentinel header 字符串（兼容旧接口）。"""
-    sentinel_val, _oai_sc_val = _build_sentinel_token_tuple(session, device_id, flow, user_agent=user_agent, sec_ch_ua=sec_ch_ua)
+    details: dict[str, str] = {}
+    try:
+        sentinel_val, _oai_sc_val = _build_sentinel_token_tuple(
+            session,
+            device_id,
+            flow,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            details=details,
+        )
+    except Exception:
+        errors = ", ".join(
+            f"{key}={value}" for key, value in details.items() if key.endswith("_error") and value
+        )
+        log(f"[sentinel:{flow}] 生成失败{f': {errors}' if errors else ''}", "red")
+        raise
+    log(
+        f"[sentinel:{flow}] mode={details.get('mode', '?')} "
+        f"p={len(details.get('proof', ''))} t={len(details.get('turnstile', ''))} "
+        f"c={len(details.get('challenge', ''))} so={len(details.get('so', ''))}"
+    )
     return sentinel_val
 
 
@@ -513,8 +533,6 @@ class PlatformRegistrar:
                 raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
-            if data.get("message") == "Failed to create account. Please try again.":
-                step(index, "注册失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"user_register_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
         step(index, "提交注册密码完成")
@@ -567,8 +585,6 @@ class PlatformRegistrar:
                 raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
         if resp is None or resp.status_code not in (200, 302):
             data = _response_json(resp) if resp is not None else {}
-            if data.get("message") == "Failed to create account. Please try again.":
-                step(index, "创建账号失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"create_account_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
         data = _response_json(resp)
