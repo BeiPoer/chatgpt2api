@@ -58,8 +58,8 @@ function createStorage() {
       values.set(String(key), String(value));
       return true;
     },
-    ownKeys(target) {
-      return [...Reflect.ownKeys(target), ...values.keys()];
+    ownKeys() {
+      return [...values.keys()];
     },
     getOwnPropertyDescriptor(target, key) {
       return Reflect.getOwnPropertyDescriptor(target, key) ||
@@ -239,6 +239,13 @@ async function main() {
 
   const localStorage = createStorage();
   const sessionStorage = createStorage();
+  localStorage.setItem("STATSIG_LOCAL_STORAGE_INTERNAL_STORE_V4", "{}");
+  localStorage.setItem("STATSIG_LOCAL_STORAGE_STABLE_ID", deviceId);
+  localStorage.setItem("client-correlated-secret", deviceId.replace(/-/g, ""));
+  localStorage.setItem("oai/apps/capExpiresAt", String(Date.now() + 3600000));
+  localStorage.setItem("oai-did", deviceId);
+  localStorage.setItem("STATSIG_LOCAL_STORAGE_LOGGING_REQUEST", "{}");
+  localStorage.setItem("UiState.isNavigationCollapsed.1", "false");
   const timerIds = new Set();
   const intervalIds = new Set();
   const trackedSetTimeout = (callback, delay = 0, ...args) => {

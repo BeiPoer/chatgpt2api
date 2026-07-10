@@ -28,6 +28,7 @@ def fake_sdk(turnstile_expression: str) -> str:
     return f"""
 var SentinelSDK = {{
   async token(flow) {{
+    if (!localStorage["oai-did"].length) throw new Error("missing oai-did");
     localStorage.setItem("sentinel", "ok");
     const node = document.createElement("div");
     document.body.appendChild(node);
