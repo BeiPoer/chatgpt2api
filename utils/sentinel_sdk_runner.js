@@ -279,6 +279,7 @@ async function main() {
     performance,
     crypto: webcrypto,
     screen: { width: 1920, height: 1080, availWidth: 1920, availHeight: 1040, colorDepth: 24, pixelDepth: 24 },
+    history: { length: 2, state: null, scrollRestoration: "auto", pushState() {}, replaceState() {}, back() {}, forward() {}, go() {} },
     innerWidth: 1920,
     innerHeight: 969,
     outerWidth: 1920,
