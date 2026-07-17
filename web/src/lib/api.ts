@@ -346,6 +346,8 @@ export type RegisterConfig = {
   target_quota: number;
   target_available: number;
   check_interval: number;
+  /** 被 Cloudflare 拦截后休眠秒数，默认 3，避免立刻补新任务疯狂申请邮箱 */
+  cf_block_sleep: number;
   stats: {
     job_id?: string;
     success: number;

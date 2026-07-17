@@ -192,6 +192,53 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         self.assertIn("status=403", message)
         self.assertIn("challenge body", message)
 
+    def test_worker_sleeps_after_cloudflare_block(self):
+        sleep_calls: list[float] = []
+
+        class FakeRegistrar:
+            def __init__(self, proxy=""):
+                self.proxy = proxy
+
+            def register(self, index):
+                raise RuntimeError("被 Cloudflare 拦截，可尝试使用 FlareSolverr: status=403")
+
+            def close(self):
+                return None
+
+        with patch.object(openai_register, "PlatformRegistrar", FakeRegistrar), patch.object(
+            openai_register,
+            "config",
+            {**openai_register.config, "proxy": "", "cf_block_sleep": 3},
+        ), patch.object(openai_register.time, "sleep", side_effect=lambda seconds: sleep_calls.append(seconds)):
+            result = openai_register.worker(1)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Cloudflare", result["error"])
+        self.assertEqual(sleep_calls, [3.0])
+
+    def test_worker_skips_sleep_when_cf_block_sleep_is_zero(self):
+        sleep_calls: list[float] = []
+
+        class FakeRegistrar:
+            def __init__(self, proxy=""):
+                pass
+
+            def register(self, index):
+                raise RuntimeError("被 Cloudflare 拦截，status=403")
+
+            def close(self):
+                return None
+
+        with patch.object(openai_register, "PlatformRegistrar", FakeRegistrar), patch.object(
+            openai_register,
+            "config",
+            {**openai_register.config, "proxy": "", "cf_block_sleep": 0},
+        ), patch.object(openai_register.time, "sleep", side_effect=lambda seconds: sleep_calls.append(seconds)):
+            result = openai_register.worker(2)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(sleep_calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

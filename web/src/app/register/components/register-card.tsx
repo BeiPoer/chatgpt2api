@@ -22,6 +22,7 @@ export function RegisterCard() {
   const setTargetQuota = useSettingsStore((state) => state.setRegisterTargetQuota);
   const setTargetAvailable = useSettingsStore((state) => state.setRegisterTargetAvailable);
   const setCheckInterval = useSettingsStore((state) => state.setRegisterCheckInterval);
+  const setCfBlockSleep = useSettingsStore((state) => state.setRegisterCfBlockSleep);
   const setMailField = useSettingsStore((state) => state.setRegisterMailField);
   const setMailApiUseRegisterProxy = useSettingsStore((state) => state.setRegisterMailApiUseRegisterProxy);
   const addProvider = useSettingsStore((state) => state.addRegisterProvider);
@@ -122,6 +123,17 @@ export function RegisterCard() {
             <div className="space-y-2">
               <label className="text-sm text-stone-700">检查间隔（秒）</label>
               <Input value={String(config.check_interval || "")} onChange={(event) => setCheckInterval(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled || config.mode === "total"} />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">CF 拦截休眠（秒）</label>
+              <Input
+                value={String(config.cf_block_sleep ?? 3)}
+                onChange={(event) => setCfBlockSleep(event.target.value)}
+                placeholder="3"
+                className="h-10 rounded-xl border-stone-200 bg-white"
+                disabled={config.enabled}
+              />
+              <p className="text-xs text-stone-500">被 Cloudflare 拦截后休眠再释放调度槽，避免立刻申请新邮箱触发 429。默认 3 秒，0 表示不休眠。</p>
             </div>
           </div>
 

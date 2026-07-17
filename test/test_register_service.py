@@ -16,6 +16,16 @@ class FakeAccountService:
 
 
 class RegisterServiceSchedulerTests(unittest.TestCase):
+    def test_normalize_defaults_cf_block_sleep(self) -> None:
+        cfg = register_service_module._normalize({})
+        self.assertEqual(cfg["cf_block_sleep"], 3.0)
+
+        cfg = register_service_module._normalize({"cf_block_sleep": "5.5"})
+        self.assertEqual(cfg["cf_block_sleep"], 5.5)
+
+        cfg = register_service_module._normalize({"cf_block_sleep": -1})
+        self.assertEqual(cfg["cf_block_sleep"], 0.0)
+
     def test_available_mode_releases_stale_worker_slot_and_submits_next_task(self) -> None:
         calls: list[int] = []
         second_call = threading.Event()

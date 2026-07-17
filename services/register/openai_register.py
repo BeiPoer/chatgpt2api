@@ -32,11 +32,14 @@ config = {
     "proxy": "",
     "total": 10,
     "threads": 3,
+    # 被 Cloudflare 拦截后，worker 结束前休眠秒数，避免立刻补新任务疯狂申请邮箱（如 YYDS 429）
+    "cf_block_sleep": 3,
 }
+_REGISTER_CONFIG_KEYS = ("mail", "proxy", "total", "threads", "cf_block_sleep")
 register_config_file = base_dir.parents[1] / "data" / "register.json"
 try:
     saved_config = json.loads(register_config_file.read_text(encoding="utf-8"))
-    config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads") if key in saved_config})
+    config.update({key: saved_config[key] for key in _REGISTER_CONFIG_KEYS if key in saved_config})
 except Exception:
     pass
 
@@ -638,6 +641,19 @@ class PlatformRegistrar:
         }
 
 
+def _is_cloudflare_block_error(error: BaseException | str) -> bool:
+    text = str(error or "")
+    return "被 Cloudflare 拦截" in text or "Cloudflare clearance" in text
+
+
+def _cf_block_sleep_seconds() -> float:
+    try:
+        value = float(config.get("cf_block_sleep", 3) or 0)
+    except (TypeError, ValueError):
+        value = 3.0
+    return max(0.0, value)
+
+
 def worker(index: int) -> dict:
     start = time.time()
     registrar = PlatformRegistrar(config["proxy"])
@@ -662,6 +678,11 @@ def worker(index: int) -> dict:
             stats["done"] += 1
             stats["fail"] += 1
         log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {e}", "red")
+        if _is_cloudflare_block_error(e):
+            sleep_seconds = _cf_block_sleep_seconds()
+            if sleep_seconds > 0:
+                step(index, f"被 Cloudflare 拦截，休眠 {sleep_seconds:g}s 后再释放调度槽，避免立即申请新邮箱", "yellow")
+                time.sleep(sleep_seconds)
         return {"ok": False, "index": index, "error": str(e)}
     finally:
         registrar.close()
