@@ -3,9 +3,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import platform
 import random
 import secrets
+import shutil
 import string
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -353,6 +357,175 @@ def request_with_local_retry(session: requests.Session, method: str, url: str, r
     return None, last_error
 
 
+
+
+# 注册环境诊断：只读日志，不改变请求流程。用于对比本地/线上出口与会话差异。
+_IP_PROBE_URLS = (
+    "https://api.ipify.org?format=json",
+    "https://api64.ipify.org?format=json",
+    "https://ifconfig.me/ip",
+)
+_AUTH_COOKIE_HINTS = (
+    "oai-did",
+    "oai-sc",
+    "cf_clearance",
+    "__cf_bm",
+    "login_session",
+    "auth_session",
+    "session",
+    "oidc",
+    "state",
+    "did",
+)
+
+
+def _mask_proxy_url(proxy_url: str) -> str:
+    raw = str(proxy_url or "").strip()
+    if not raw:
+        return "(empty)"
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return raw[:80]
+    if not parsed.scheme and not parsed.netloc:
+        return raw[:80]
+    host = parsed.hostname or ""
+    port = f":{parsed.port}" if parsed.port else ""
+    user = parsed.username or ""
+    if user:
+        return f"{parsed.scheme}://{user}:***@{host}{port}"
+    return f"{parsed.scheme}://{host}{port}"
+
+
+def _cookie_diag_summary(session: requests.Session) -> str:
+    names: list[str] = []
+    interesting: list[str] = []
+    try:
+        jar = getattr(session.cookies, "jar", None)
+        cookies = list(jar) if jar is not None else []
+        if not cookies:
+            try:
+                names = sorted({str(k) for k, _ in session.cookies.items()})
+            except Exception:
+                names = []
+            return (
+                "count=0 names=[]"
+                if not names
+                else f"count={len(names)} names={','.join(names[:20])}"
+            )
+        for cookie in cookies:
+            name = str(getattr(cookie, "name", "") or "")
+            domain = str(getattr(cookie, "domain", "") or "")
+            if not name:
+                continue
+            names.append(name)
+            lowered = name.lower()
+            if any(hint in lowered for hint in _AUTH_COOKIE_HINTS):
+                value = str(getattr(cookie, "value", "") or "")
+                interesting.append(f"{name}@{domain or '?'}(len={len(value)})")
+        unique_names = sorted(set(names))
+        interesting_text = ",".join(interesting[:12]) if interesting else "-"
+        return (
+            f"count={len(names)} names={','.join(unique_names[:24])} "
+            f"key=[{interesting_text}]"
+        )
+    except Exception as exc:
+        return f"cookie_diag_error={type(exc).__name__}:{exc}"
+
+
+def _probe_egress_ip(session: requests.Session, proxy: str = "") -> str:
+    """Probe public egress IP via a throwaway session (do not pollute auth cookies)."""
+    last_error = ""
+    probe_session = None
+    try:
+        # Reuse the same session factory as registration so proxy selection matches.
+        probe_session = create_session(proxy)
+        for url in _IP_PROBE_URLS:
+            try:
+                resp = probe_session.get(url, timeout=8, verify=False)
+                if resp is None:
+                    last_error = "empty_response"
+                    continue
+                status = int(getattr(resp, "status_code", 0) or 0)
+                body = str(getattr(resp, "text", "") or "").strip()
+                if status != 200 or not body:
+                    last_error = f"http_{status}"
+                    continue
+                if "json" in url:
+                    try:
+                        data = resp.json()
+                        ip = str((data or {}).get("ip") or "").strip()
+                        if ip:
+                            return ip
+                    except Exception:
+                        pass
+                candidate = body.split()[0].strip().strip('"')
+                if (
+                    candidate
+                    and len(candidate) <= 64
+                    and " " not in candidate
+                    and "<" not in candidate
+                ):
+                    return candidate
+                last_error = "unrecognized_body"
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}:{exc}"
+        return f"probe_failed:{last_error or 'unknown'}"
+    except Exception as exc:
+        return f"probe_failed:{type(exc).__name__}:{exc}"
+    finally:
+        if probe_session is not None:
+            try:
+                probe_session.close()
+            except Exception:
+                pass
+
+
+def _runtime_diag_line(proxy_config: str = "") -> str:
+    try:
+        profile = proxy_settings.get_profile(proxy=proxy_config, upstream=True)
+    except Exception as exc:
+        profile = None
+        profile_error = f"{type(exc).__name__}:{exc}"
+    else:
+        profile_error = ""
+    node_path = shutil.which("node") or shutil.which("nodejs") or ""
+    if node_path:
+        try:
+            completed = subprocess.run(
+                [node_path, "-v"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            node_version = str(completed.stdout or completed.stderr or "").strip()
+        except Exception as exc:
+            node_version = f"err:{type(exc).__name__}"
+    else:
+        node_version = "missing"
+    proxy_selected = getattr(profile, "proxy_url", "") if profile is not None else ""
+    proxy_source = (
+        getattr(profile, "proxy_source", "?")
+        if profile is not None
+        else f"error:{profile_error}"
+    )
+    runtime_enabled = getattr(profile, "runtime_enabled", "?") if profile is not None else "?"
+    egress_mode = getattr(profile, "egress_mode", "?") if profile is not None else "?"
+    clearance_mode = getattr(profile, "clearance_mode", "?") if profile is not None else "?"
+    return (
+        f"os={platform.system()}/{platform.release()} "
+        f"arch={platform.machine()} py={sys.version.split()[0]} "
+        f"node={node_version or '?'} node_path={node_path or '-'} "
+        f"proxy_config={_mask_proxy_url(proxy_config)} "
+        f"proxy_selected={_mask_proxy_url(str(proxy_selected or ''))} "
+        f"proxy_source={proxy_source} "
+        f"runtime_enabled={runtime_enabled} "
+        f"egress_mode={egress_mode} "
+        f"clearance={clearance_mode}"
+    )
+
+
 def validate_otp(session: requests.Session, device_id: str, code: str):
     headers = dict(common_headers)
     headers["referer"] = f"{auth_base}/email-verification"
@@ -426,9 +599,29 @@ class PlatformRegistrar:
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
+        self._diag_logged_runtime = False
 
     def close(self) -> None:
         self.session.close()
+
+    def _log_runtime_diag(self, index: int) -> None:
+        if self._diag_logged_runtime:
+            return
+        self._diag_logged_runtime = True
+        try:
+            step(index, f"[diag] runtime {_runtime_diag_line(self.proxy)}", "yellow")
+        except Exception as exc:
+            step(index, f"[diag] runtime_error={type(exc).__name__}:{exc}", "yellow")
+
+    def _log_egress_diag(self, index: int, phase: str) -> str:
+        try:
+            ip = _probe_egress_ip(self.session, self.proxy)
+            cookies = _cookie_diag_summary(self.session)
+            step(index, f"[diag] egress@{phase} ip={ip} cookies={cookies}", "yellow")
+            return ip
+        except Exception as exc:
+            step(index, f"[diag] egress@{phase}_error={type(exc).__name__}:{exc}", "yellow")
+            return ""
 
     def _navigate_headers(self, referer: str = "") -> dict[str, str]:
         headers = dict(navigate_headers)
@@ -470,6 +663,8 @@ class PlatformRegistrar:
 
     def _platform_authorize(self, email: str, index: int) -> None:
         step(index, "开始 platform authorize")
+        self._log_runtime_diag(index)
+        self._log_egress_diag(index, "before_authorize")
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
         self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
         self.code_verifier, code_challenge = _generate_pkce()
@@ -516,9 +711,11 @@ class PlatformRegistrar:
         # 仅打日志，不据此中断：authorize 落地页无法可靠区分注册/登录，
         # 真正的判定交给 user/register（失败会 dump 完整响应）。
         step(index, f"platform authorize 完成[{landed or '?'}] url={str(getattr(resp, 'url', '') or '')[:160]}")
+        self._log_egress_diag(index, "after_authorize")
 
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
+        self._log_egress_diag(index, "before_register")
         url = f"{auth_base}/api/accounts/user/register"
         headers = self._json_headers(f"{auth_base}/create-account/password")
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create")
@@ -537,8 +734,10 @@ class PlatformRegistrar:
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
+            self._log_egress_diag(index, "register_failed")
             raise RuntimeError(error or f"user_register_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
         step(index, "提交注册密码完成")
+        self._log_egress_diag(index, "after_register")
 
     def _send_otp(self, index: int) -> None:
         step(index, "开始发送验证码")
